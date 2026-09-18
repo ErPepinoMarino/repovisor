@@ -1,0 +1,19 @@
+### OS ###
+Thumbs.db
+.DS_Store
+
+### Editores ###
+.idea/
+.vscode/
+
+### Env (secretos: nunca versionar; los *.example sí se versionan) ###
+.env
+.env.*
+!.env.example
+
+### Logs ###
+*.log
+
+### Node (raíz; apps/web tiene su propio .gitignore) ###
+node_modules/
+.next/
