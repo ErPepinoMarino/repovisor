@@ -1,0 +1,13 @@
+node_modules
+.next
+out
+build
+.next
+package-lock.json
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+next-env.d.ts
+public
