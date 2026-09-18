@@ -444,6 +444,7 @@ El producto es "ver la arquitectura". Sin mapa interactivo no hay producto. Adem
 - `@xyflow/react@^12`, `dagre` (layout). Alternativa más potente `elkjs` — se recomienda dagre por simplicidad; elkjs queda como mejora post-MVP.
 
 **Implementación**
+- Convención de aristas (decisión de diseño): dirección **"depende de"** — flecha del *importador* al *importado* (`matchService → rankings`). Si "X hace `import` de Y", entonces `X → Y`. Consistente en `edges`, API y React Flow (React Flow permite invertir dirección en el mapa).
 - `GET /api/v1/analyses/{id}/architecture` en Spring Boot (devuelve modules + edges + structure + deps resumidos).
 - Componentes en `apps/web`:
   - `AnalysisMap` (área React Flow).
