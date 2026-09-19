@@ -1,24 +1,26 @@
+name: throttle-mini-lab
+
 services:
   postgres:
     image: postgres:17
-    container_name: repovisor-postgres
+    container_name: throttle-mini-lab-postgres
     environment:
-      POSTGRES_USER: repovisor
-      POSTGRES_PASSWORD: repovisor
-      POSTGRES_DB: repovisor
+      POSTGRES_USER: throttlelab
+      POSTGRES_PASSWORD: throttlelab
+      POSTGRES_DB: throttle_mini_lab
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U repovisor -d repovisor"]
+      test: ["CMD-SHELL", "pg_isready -U throttlelab -d throttle_mini_lab"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   redis:
     image: redis:7-alpine
-    container_name: repovisor-redis
+    container_name: throttle-mini-lab-redis
     ports:
       - "6379:6379"
     volumes:

@@ -1,0 +1,8 @@
+# Perfil `runner`: genera la carga del banco de pruebas contra la API.
+#
+# Deliberadamente arranca SIN servidor web (`web-application-type: none`):
+# un generador de carga que además sirve páginas no es un generador de carga.
+# Es el mismo JAR que el perfil `api`, arrancado de otra forma.
+spring:
+  main:
+    web-application-type: none

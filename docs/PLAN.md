@@ -1,1034 +1,779 @@
-# RepoVisor — Plan de desarrollo
+# throttle_mini_lab — Plan de desarrollo
 
-> **RepoVisor** (antes *CodeMapper*). Web app que analiza repositorios públicos de GitHub y genera un mapa interactivo de arquitectura y un documento de onboarding.
+> **Qué es.** Un banco de pruebas local para decidir **cómo** implementar el límite de peticiones de una aplicación: **contador en memoria del proceso · Postgres · Redis**. Aplica el mismo límite de tres formas distintas, las somete a **el mismo perfil de carga** y publica un **veredicto con la evidencia generada**.
 >
-> Objetivo personal: demostrar experiencia práctica real como **Software / Full-Stack / Product / AI-oriented Engineer**, aprendiendo de verdad **Java moderno, Spring Boot, Redis Streams, background jobs y sistemas asíncronos**. NO es un proyecto de Data/DevOps/ML/Backend.
+> **Incluye deliberadamente los casos en los que Redis no vale la pena.** La mitad del valor de esta herramienta es decirte **cuándo NO usarlo**. Si una corrida demuestra que un `ConcurrentHashMap` gana, se publica igual.
 >
-> **Sin deployment público.** RepoVisor es una aplicación full-stack que corre íntegramente en **local con Docker Compose**, con tests, y que se demuestra mediante una **demo grabada en vídeo** y un README de portfolio. MVP en **4–6 semanas** por una sola persona.
+> **Objetivo personal.** Aprender de verdad **Java moderno, Spring Boot y Redis** construyendo algo terminado, medible y reproducible. El proyecto es la excusa; el aprendizaje es el producto.
+>
+> **No es un producto.** Nadie vende nada aquí: no hay clientes, ni precios, ni planes comerciales. Alguien se lo monta en su casa o en un servidor propio y lo usa para decidir.
+>
+> **Sin deployment público.** Corre en local con Docker Compose. Se demuestra con un informe reproducible y una demo grabada en vídeo.
 
 ---
 
 ## Cómo usar este plan
 
-- Trabajamos **fase por fase**, en orden. Nunca se salta una fase.
+- Trabajamos **fase por fase, en orden**. Nunca se salta una fase.
 - Antes de implementar cada fase: 1) entender el objetivo, 2) revisar las tecnologías nuevas, 3) definir exactamente qué se construye, 4) implementar, 5) probar, 6) verificar los criterios de aceptación.
-- Cada fase produce **una parte funcional del producto** y es verificable antes de continuar.
-- Cuando una fase propone varias opciones, hay una **recomendación** con su justificación (aprendizaje, simplicidad, coste, mantenibilidad, valor de entrevista).
-- Tu perfil ya cubre Next/React/TS/Node/PostgreSQL/JWT/SSE/testing/deploy. **El aprendizaje nuevo se concentra en Java moderno, Spring Boot, Redis Streams, background jobs, async y composición local multi-servicio con Docker Compose.** No repetimos lo que ya dominas salvo cuando el flujo lo requiere.
+- Cada fase termina con **el sistema funcionando de punta a punta**; nunca con una pieza a medias ni con "código desechable" que se tira en la fase siguiente.
+- La validación se hace siempre con **`mvn clean verify`**, nunca con `mvn compile`. `mvn compile` no recompila si las clases son más nuevas que las fuentes y devuelve falsos verdes: en este proyecto ya ocultó una clase inexistente que rompía el build.
+- Cuando una fase propone alternativas, hay una **recomendación** con su justificación.
 
-Principio arquitectónico rector (no negociable):
+## Principios rectores (no negociables)
 
-```text
-Code analysis → descubre hechos (programático, determinista)
-AI           → interpreta, resume, explica, documenta
-```
+1. **Medir, no opinar.** Ninguna afirmación del README existe sin una corrida reproducible que la respalde y cite sus propias cifras.
+2. **Decir cuándo NO usar Redis es parte del producto.** Una herramienta que siempre vende Redis no sirve: es publicidad.
+3. **La UI visualiza; el servidor mide.** Ningún tiempo se toma en el navegador: el event loop de JavaScript y la red invalidan la medición.
+4. **Comparación justa o no es comparación.** Mismos datos, misma carga, mismo entorno, y **modos de medición declarados** (nunca 1 conexión síncrona contra un pool de 10 sin decirlo).
+5. **Percentiles, nunca promedios.** p50/p95/p99 más dispersión. El promedio esconde exactamente lo que interesa (la cola y los picos).
+6. **El generador de carga no compite con lo medido.** Vive en otro proceso y sin servidor web. Si comparte JVM con la API, la medición es basura.
 
-**Dato técnico que condiciona el plan**: desarrollo en Windows → Redis y el worker no corren nativos. La solución no es pelear con el sistema, es usar Docker como entorno de desarrollo para esos servicios desde la Fase 7. Docker pasa de "fase final" a **necesidad en F7**; en F11/F12 se convierte en el **entorno reproducible que define el entregable final** del proyecto (nada de deployment público).
-
----
-
-# A. Arquitectura final propuesta
+## A. Arquitectura final
 
 ```text
-┌───────────────────────┐
-│  Next.js (web)        │  Formulario, polling de estado, mapa React Flow, onboarding
-│  React + Tailwind     │  @xyflow/react v12
-└──────────┬────────────┘
-           │  HTTP / REST (local)
-┌──────────▼────────────┐
-│  Spring Boot (api)    │  POST /analyses → crea job · GET /analyses/{id} → estado
-│  Spring MVC           │  GET …/architecture · GET …/documents · rate limit
-│  Spring Data JPA      │
-└──────┬──────────┬─────┘
-       │          │  enqueue (Redis Streams)
-       │          └──────────► ┌───────────────┐
-       │                       │  Redis        │  · Stream (job queue)
-       │                       │               │  · rate limiting
-       │                       └──────┬────────┘
-       │                              │  Stream consumer (Spring Boot worker)
-       │                       ┌──────▼──────────────────────────────┐
-       │                       │  Spring Boot Worker                  │
-       │                       │  clone (tarball) → scan → deps →    │
-       │                       │  module graph (JavaParser / tree-   │
-       │                       │  sitter) → AI enrichment (onboarding,│
-       │                       │  best-effort, cacheado, degradable)  │
-       │                       └──────┬──────────────────────────────┘
-       │                              │
-       └──────────────► ┌─────────────▼─────────────┐
-                        │  PostgreSQL               │  fuente de verdad:
-                        │  analyses + artefactos    │  estado, structure, modules,
-                        │  (JSONB)                  │  edges, deps, ai_docs
-                        └───────────────────────────┘
-```
+┌────────────────────────────────┐
+│  Next.js (web)                 │  ① describe el perfil de carga
+│  React + Tailwind              │  ② lanza una corrida y la ve en vivo
+│                                │  ③ lee el veredicto y el histórico
+└───────────┬────────────────────┘
+            │ HTTP / REST
+┌───────────▼────────────────────┐        ┌────────────────────────────┐
+│  Spring Boot · perfil `api`    │───────►│  PostgreSQL                │
+│  · endpoints de ejemplo        │        │  · claves y cuotas         │
+│  · filtro de límite (3 impl.)  │        │  · cubos del limitador     │
+│  · API del comparador          │        │  · corridas y resultados   │
+└───────────┬────────────────────┘        └────────────────────────────┘
+            │
+            │  implementaciones intercambiables
+┌───────────▼─────────────────────┐       ┌────────────────────────────┐
+│  RateLimiter  (interfaz)        │       │  Redis                     │
+│  ├── InProcessRateLimiter       │       │  · ventanas, tokens, ZSET  │
+│  ├── PostgresRateLimiter  ──────┼──────►│  · TTL + scripts Lua       │
+│  └── RedisRateLimiter     ──────┘       │  · efímero y prescindible  │
+└─────────────────────────────────┘       └────────────────────────────┘
 
-Componentes y responsabilidades:
+┌────────────────────────────────┐
+│  Spring Boot · perfil `runner` │  genera la carga y reporta al API.
+│  sin servidor web              │  Proceso aparte a propósito.
+└────────────────────────────────┘
+```
 
 | Componente | Proceso | Responsabilidad |
 |---|---|---|
-| `web` | Next.js | Producto: formulario, estados del análisis, mapa, onboarding. Sin lógica de negocio. |
-| `api` | Spring Boot (`--spring.profiles.active=api`) | Contrato REST, validación, creación de jobs, consulta de resultados. No analiza nada. |
-| `worker` | Spring Boot (`--spring.profiles.active=worker`) | Todo el análisis determinista + AI enrichment. Un proceso, pipeline por etapas. |
-| `redis` | Redis | Stream de jobs (job queue) + rate limiting. **No es fuente de verdad** de estado. |
-| `postgres` | PostgreSQL | Fuente de verdad: estado del análisis y todos los artefactos generados. |
+| `web` | Next.js | Producto: describir la carga, lanzar la corrida, ver el veredicto. **No mide.** |
+| `api` | Spring Boot (`--spring.profiles.active=api`) | Endpoints de ejemplo + filtro de límite + API del comparador. Aplica el límite; no lo mide. |
+| `runner` | Spring Boot (`--spring.profiles.active=runner`) | Genera la carga, mide, agrega y reporta. **No expone HTTP.** |
+| `postgres` | PostgreSQL | Fuente de verdad: claves, cuotas, cubos del limitador y **resultados de las corridas**. |
+| `redis` | Redis | Estado **efímero** del limitador. Si se vacía, el sistema sigue funcionando. |
 
-Decisiones que cierran la arquitectura:
+### Decisiones que cierran la arquitectura
 
-1. **La fuente de verdad del estado es Postgres**, no Redis. Redis guarda la cola; el estado de negocio (queued → completed/failed) vive en persistencia. Así el estado sobrevive reinicios del worker o de Redis.
-2. **`api` y `worker` son dos procesos del MISMO proyecto Spring Boot** (un solo `pom.xml`, dos profiles `api`/`worker`). Razón: comparten 100% de modelos de dominio, funciones de análisis, jobs y acceso a DB. Separarlos en dos módulos solo añade plomería en el MVP. En el stack local se empaqueta **una** imagen Docker con dos comandos (`java -jar app.jar --spring.profiles.active=api` / `worker`), y la orquestación con Compose reproduce la composición de procesos del sistema completo.
-   - *Alternativa* (anotada, no recomendada para MVP): dos módulos Maven + paquete compartido. Más "enterprise", más fricción. Se puede refactorizar después si hay necesidad real.
-3. **Artefactos de análisis en columnas JSONB** (structure, modules, edges, dependencies, ai_docs) en lugar de tablas relacionales finas. Razón: se escriben una vez, se leen enteros, nunca se consultan por campo. JSONB con `@JdbcTypeCode(SqlTypes.JSON)` es más simple y perfectamente defendible. Normalizar sería sobre-modelar ahora.
-4. **Se elimina el transporte vía git clone por SSH/HTTPS** como fuente principal: descarga por **tarball** (codeload.github.com) sin binario git en la imagen. Más rápido, más determinista, y sin credenciales. Un transporte **local** (carpeta del repo) se añadirá en F12 para tests y demo sin red.
-5. **El worker se ejecuta en Docker (imagen Linux) incluso en desarrollo.** Redis tampoco corre nativo en Windows. Es la decisión que hace viable el plan en tu máquina.
+1. **Un solo proyecto Spring Boot, dos perfiles (`api` y `runner`).** Comparten modelos y configuración; separarlos en dos módulos solo añade plomería. El `runner` arranca con `spring.main.web-application-type=none`: **un generador de carga que además sirve páginas no es un generador de carga**, y compartir JVM con la API contaminaría la latencia medida (GC, hilos, planificador).
+2. **Una interfaz, tres adaptadores.** `RateLimiter` con implementaciones en memoria, Postgres y Redis. Es el único sitio del stack donde una abstracción con varias implementaciones se justifica **hoy**: el producto *es* compararlas. No es especulación sobre "algún día quizá otra base de datos".
+3. **Las tres implementaciones del límite se prueban contra el MISMO contrato de tests.** Un mismo test de exactitud y un mismo test de concurrencia corren contra las tres; si un adaptador no los pasa, no es una implementación válida (es una fuente de conclusiones falsas).
+4. **El perfil de carga es un dato persistido, no unos parámetros de línea de comandos.** Se guarda en Postgres junto con el commit y la configuración del entorno, de modo que cualquier corrida se puede **repetir** y cualquier conclusión se puede **rebatir**.
+5. **Redis es efímero y prescindible.** Nunca guarda resultados ni estado de negocio: solo las ventanas del limitador, que caducan solas. Un `FLUSHALL` no pierde nada que importe. Los resultados de las corridas viven en Postgres.
+6. **La UI nunca mide.** Solo pide, visualiza y compara lo que el servidor ya midió. Es la regla que impide el error clásico de medir en el navegador.
+7. **El entorno se declara en el resultado.** CPU, memoria, si el cliente corrió dentro o fuera de la red de Docker y la versión de cada servidor. Un benchmark sin entorno no es un dato, es un rumor.
 
----
+## B. Conceptos que hay que dominar antes de medir
 
-# B. Roadmap por fases (13 fases)
+Sin este vocabulario, los números que produzca el laboratorio no significarán nada.
+
+### B.1 Vocabulario de medición
+
+| Término | Qué es | Por qué importa aquí |
+|---|---|---|
+| **Latencia** | tiempo de **una** petición | lo que sufre quien usa el sistema |
+| **Throughput** | peticiones por segundo | lo que aguanta el sistema en total |
+| **p50 / p95 / p99** | percentiles de latencia | el p99 es lo que ve el usuario cuando el sistema va cargado; el promedio lo esconde |
+| **Dispersión** | variabilidad entre corridas | un número sin dispersión no es un dato |
+| **Warmup** | calentar antes de medir | JIT de la JVM, pool de conexiones, caché de Postgres. Sin calentar, mides el arranque |
+| **RTT** | ida y vuelta por red | en local puede dominar más que el propio cálculo |
+| **Pipelining** | agrupar comandos en un solo envío | multiplica el throughput de Redis sin tocar el servidor |
+| **Hot key / distribución zipf** | unas pocas claves recibiendo casi toda la carga | es la carga **real**; la distribución uniforme es una ficción que favorece a quien mide mal |
+| **Exactitud** | decisiones acertadas frente al límite teórico | un limitador rápido e incorrecto es peor que uno lento y correcto |
+
+### B.2 Los límites reales de Redis (lo que este laboratorio exhibe)
+
+1. **Single-threaded**: un único hilo ejecuta los comandos. Ese es su techo real: **un core**. Escala con pipelining y con más instancias, no con más hilos.
+2. **El round-trip manda**: con una conexión síncrona se paga un RTT por operación. Con pipelining, o con Lua (varios comandos en un solo viaje), el throughput cambia de orden de magnitud. Comparar sin declararlo es hacer trampa.
+3. **Todo vive en RAM**: el dataset completo compite con tu presupuesto de memoria. El coste por clave y la fragmentación se ven con `MEMORY USAGE` y `INFO memory`.
+4. **Picos por persistencia**: `BGSAVE` y la reescritura del AOF hacen `fork()` con copy-on-write y provocan **picos de latencia** visibles en el p99. Es comportamiento real, no un fallo.
+5. **Una sola clave caliente = un solo core**: las *hot keys* no se reparten solas; hay que diseñar el reparto (sharding de clave) y aquí se puede medir cuánto se gana.
+6. **Eviction silenciosa**: con `maxmemory` y política LRU/LFU, Redis borra claves sin avisar. Un limitador con eviction agresiva **deja de limitar**, y eso aparece en el eje de exactitud, no en el de latencia.
+
+### B.3 Los límites reales de Postgres (para no caricaturizarlo)
+
+1. **Una fila caliente = contención**: muchas escrituras concurrentes sobre la misma fila se serializan por bloqueo y el throughput se derrumba.
+2. **Cada escritura es WAL y `fsync`**: eso es **durabilidad**, no un defecto. Pagar latencia por durabilidad es un *trade-off*, no una derrota.
+3. **Bloat y autovacuum**: las escrituras repetidas generan versiones muertas de la fila; la tabla se hincha y hay que limpiarla.
+4. **Si el working set cabe en `shared_buffers`, Postgres puede empatar o ganar** contra Redis. Esa es la conclusión más valiosa que puede producir el laboratorio: **cuándo Redis no aporta nada**.
+5. **El pool de conexiones es su techo práctico**: más hilos que conexiones disponibles no mejoran nada.
+6. **Y donde Redis no puede competir**: `JOIN`, agregaciones ad-hoc, transacciones entre varias entidades y cualquier pregunta que no conozcas de antemano.
+
+
+
+## C. El producto
+
+### C.1 Las tres pantallas
+
+1. **Claves y cuotas** — crear y revocar claves de prueba y asignarles un escenario de cuota. Aquí se ve el límite funcionando de verdad (también con `curl`).
+2. **Comparador** — el corazón. Describir el perfil de carga, lanzar la corrida, y verla en vivo: latencia p50/p95/p99, throughput, errores, **exactitud** y el estado interno de los motores bajo carga.
+3. **Informe y veredicto** — histórico de corridas y la conclusión argumentada de una corrida concreta, reproducible y descargable.
+
+### C.2 El perfil de carga (lo que describe quien usa la herramienta)
+
+| Parámetro | Por qué importa |
+|---|---|
+| **rps objetivo** | es el eje de la decisión: todo cambia con el volumen |
+| **nº de claves activas** | distingue un patrón ancho de uno estrecho |
+| **distribución** (uniforme / zipf) | clave caliente frente a carga repartida: el caso real |
+| **forma de la carga** (sostenida / ráfaga) | un límite de rps y un límite de *burst* son cosas distintas |
+| **ratio lectura/escritura** | cambia el ganador por completo |
+| **duración y warmup** | sin estabilización, lo que se mide es el arranque |
+| **ubicación del cliente** (dentro o fuera de la red de Docker) | puede dominar la latencia medida |
+| **implementaciones a comparar** | una, dos o las tres |
+
+### C.3 Lo que devuelve: el veredicto
+
+No es un gráfico: es una **frase argumentada con las cifras de esa corrida**. Por ejemplo:
+
+> *"Con 400 rps, 200 claves y distribución zipf, el contador en memoria sostiene 0,3 ms de p99 y **no necesitas nada más** si tu aplicación corre en un solo proceso. Postgres aparece con 2,1 ms de p99 y contención creciente al superar N escrituras/s sobre la misma clave. Redis baja a 0,6 ms, pero añade un servicio, ~Y MB de RAM y no te da durabilidad con su configuración por defecto. **Para tu caso, Redis no se paga** salvo que necesites que varias instancias compartan el límite."*
+
+El veredicto se compone de tres bloques, siempre separados:
+1. **Ganador por eje** (latencia, throughput, exactitud, coste de recursos).
+2. **Evidencia**: las cifras concretas de la corrida que lo respaldan.
+3. **Criterios no medibles**: lo que los números no pueden decidir por ti.
+
+### C.4 Los criterios no medibles (también son parte del veredicto)
+
+Ningún benchmark decide esto, y fingir lo contrario sería deshonesto:
+
+- **¿Necesitas que varias instancias compartan el límite?** Es la pregunta que casi decide sola la respuesta: si la respuesta es sí, un contador en memoria queda descartado y Redis es la opción natural.
+- **¿Ya tienes Redis en el stack?** El coste marginal de un servicio que ya existe es prácticamente cero; añadirlo de nuevo no lo es.
+- **¿Puedes tolerar perder las ventanas al reiniciar?** Si no, un contador en memoria está fuera.
+- **¿Necesitas auditar el uso histórico?** Entonces la respuesta es Postgres, aunque sea más lento.
+- **¿Quién mantiene el servicio y quién lo conoce?** Un componente más en producción tiene un coste que no sale en ningún gráfico.
+
+
+
+## D. Rigor metodológico (las reglas del banco de pruebas)
+
+Estas reglas no son un apéndice: son lo que separa una herramienta de un tutorial. Cada una nace de un error concreto que invalidaría las conclusiones.
+
+1. **Warmup obligatorio y declarado.** Se descartan las primeras N peticiones (o M segundos) antes de medir: JIT de la JVM, pool de conexiones, caché en frío de Postgres. El warmup aplicado se guarda en el resultado.
+2. **Repeticiones y dispersión.** Cada punto se mide al menos 3 veces y se publica la mediana con su dispersión. **Nunca "el mejor de 5"**: eso es marketing, no medición.
+3. **Percentiles, nunca promedios.** p50, p95, p99 (y p99.9 si la duración lo permite).
+4. **Mismo dataset y mismo orden de claves** para las tres implementaciones: se genera una vez y se reutiliza.
+5. **Distribución zipf además de uniforme.** La carga uniforme esconde las claves calientes y favorece las conclusiones fáciles.
+6. **El modo de medición forma parte del resultado.** Comparar M1 con M2 es inválido, así que el modo entra en la clave de la corrida y el sistema no permite mezclarlos.
+7. **El generador de carga no compite con lo medido** (proceso aparte, sin servidor web) y **la latencia se toma en el cliente instrumentado**, nunca en el navegador ni deducida de logs.
+8. **El entorno va dentro del resultado**: CPU, núcleos, RAM, versión de Postgres, versión de Redis, `maxmemory` y su política, commit del código y si el cliente corrió dentro o fuera de la red de Docker.
+9. **Nada se descarta porque contradiga la hipótesis.** Si Redis pierde en un escenario, el escenario se publica con su explicación.
+10. **Una conclusión sin su corrida no se publica.** El README cita el identificador de la corrida que respalda cada afirmación.
+
+### E. Los tres modos de medición
+
+| Modo | Cómo | Qué mide | Qué NO permite concluir |
+|---|---|---|---|
+| **M1 · Round-trip puro** | 1 conexión, una operación a la vez, sin paralelismo | latencia limpia: red + servidor + protocolo | nada sobre throughput ni escalabilidad |
+| **M2 · Saturación** | pool de conexiones + pipelining/Lua, N hilos | el techo práctico de cada motor | no dice cómo se comporta a la carga real |
+| **M3 · Escenario real** | el perfil que describe quien usa la herramienta (zipf, ratio, ráfaga) | la decisión: cuál conviene *en este caso* | no es un techo: es un punto del espacio |
+
+Los tres son necesarios: **M1** compara sin trampa, **M2** encuentra el límite, **M3** responde la pregunta. Publicar solo uno sería, respectivamente, ingenuo, engañoso o anecdótico.
+
+
+
+## F. El dominio
+
+### F.1 Escenarios de cuota (no "planes comerciales")
+
+Un **escenario de cuota** es un conjunto de límites con nombre, para tener algo realista que aplicar. No es una oferta ni un precio:
+
+| Campo | Ejemplo |
+|---|---|
+| `name` | `holgado`, `ajustado`, `rafaga_corta` |
+| `requestsPerSecond` | 10 / 100 / 1000 |
+| `burst` | ráfaga permitida por encima del rps sostenido |
+| `dailyQuota` | cuota diaria (contador aparte, de vida larga) |
+| `weightPerEndpoint` | no todos los endpoints cuestan lo mismo |
+
+El **peso por endpoint** es lo que hace el laboratorio realista: limitar 100 peticiones baratas no es lo mismo que 100 que consultan la base de datos. Sin eso, el trabajo del limitador no se parece al de producción.
+
+### F.2 Claves de prueba
+
+- `id`, `keyHash` (**nunca se guarda la clave en claro**), `quotaScenario`, `status` (`ACTIVE`/`REVOKED`), `createdAt`.
+- Se generan desde la UI o por `curl`; son para someterlas a carga.
+
+### F.3 Endpoints
+
+| Endpoint | Coste | Existe para |
+|---|---|---|
+| `GET /healthz` | nulo | comprobar que está vivo |
+| `GET /v1/fast` | bajo | responder ya: aísla el coste del **limitador** del coste del trabajo |
+| `GET /v1/db` | medio | leer de Postgres: compite por el mismo recurso que `PostgresRateLimiter` |
+| `GET /v1/compute` | alto | cálculo deliberadamente caro: el límite se amortiza |
+| `GET /v1/quota` | — | consultar el estado de la propia cuota |
+
+### F.4 Respuestas y cabeceras
+
+Petición permitida → respuesta normal + cabeceras estándar:
 
 ```
-F1   Fundación: JDK, Maven, monorepo y primer Spring Boot
-F2   Frontend mínimo: formulario + polling de estado
-F3   Java + Spring Boot REST API: persistencia con JPA + Flyway
-F4   Análisis determinista #1: clone + scan + JavaParser          ← análisis sincrónico en API
-F5   Análisis determinista #2: tree-sitter + dependencias
-F6   Visualización interactiva con React Flow                     ← primer mapa real
-F7   Pipeline asíncrono: Redis Streams + worker Spring Boot       ← Docker entra aquí ⭐
-F8   AI enrichment: onboarding + explicaciones (best-effort)      ⭐
-F9   Robustez: retries, idempotencia, rate limiting
-F10  Testing y observabilidad
-F11  Docker: entorno local reproducible (compose)                 ← Docker se completa
-F12  Reproducibilidad: bootstrap limpio, transport local y smoke
-F13  Pulido, demo grabada y versión portfolio
+RateLimit-Limit: 100
+RateLimit-Remaining: 42
+RateLimit-Reset: 7
 ```
 
-**Nota sobre el orden** (respecto a tu progresión de referencia): el análisis corre **sincrónicamente** en la API hasta F7, cuando se extrae a un worker asíncrono con Redis Streams. Esto permite aprender Java y el análisis de código sin mezclar async al principio. La desventaja es que la API bloquea durante el análisis (aceptable para repos pequeños en desarrollo). La ventaja es que en F7 el cambio a async es un refactoring motivado: *"ya sabemos qué hace el análisis; ahora aprendamos a ejecutarlo sin bloquear la petición HTTP"*.
+Petición rechazada → `429 Too Many Requests` con `Retry-After` y el mismo juego de cabeceras.
 
-La **visualización (F6) sale después de tener el grafo (F4+F5)** porque el mapa necesita datos reales. No hay razón técnica para visualizar datos fake cuando el pipeline determinista produce datos reales en F4.
+Detalle de calidad: los tres valores se calculan **en la misma operación** que aplica la decisión (un único script Lua en Redis, un único `RETURNING` en Postgres, una única sección crítica en memoria). Si se calculan después, hay una carrera entre el valor que se informa y el que se aplicó.
 
----
+### F.5 Política ante caída del backend: `fail-open` o `fail-closed`
 
-## Detalle por fase
+Si Redis o Postgres no responden, el limitador no puede decidir. Hay dos respuestas legítimas y **es una decisión de negocio, no técnica**:
+
+| Política | Comportamiento | Cuándo tiene sentido |
+|---|---|---|
+| `fail-open` | deja pasar las peticiones | el límite protege capacidad, no seguridad: es preferible servir de más que caer entero |
+| `fail-closed` | rechaza todo | el límite cobra dinero o protege un recurso escaso: es preferible rechazar que regalar |
+
+Se configura por escenario de cuota y **se prueba con un test** que corta el backend a propósito. Es exactamente el tipo de detalle que separa un limitador de juguete de uno real.
+
+### F.6 Los cinco algoritmos del límite
+
+El "abanico de posibilidades" no son comandos sueltos: son cinco formas de resolver el mismo problema, cada una con su eje de *trade-off*.
+
+| Algoritmo | Idea | Exactitud | Coste |
+|---|---|---|---|
+| **Fixed window** | contador por intervalo de tiempo (`INCR` + `EXPIRE`) | ⚠️ permite el doble del límite en el borde de la ventana | mínimo: 1 clave por período |
+| **Sliding window log** | registro con marca de tiempo de cada petición (ZSET) | ✅ exacto | memoria O(n) por clave: crece con el tráfico |
+| **Sliding window counter** | pondera la ventana anterior y la actual | 🟡 aproximado (~1-3 % de error) | O(1): dos contadores |
+| **Token bucket** | cubo de fichas que se rellena a ritmo constante | ✅ exacto y **admite ráfagas** | pequeño y constante; es lo que usan Stripe, Cloudflare y Kong |
+| **Leaky bucket** | cola que se vacía a ritmo constante | ✅ exacto, sin ráfagas | pequeño; suaviza en vez de permitir picos |
+
+Medir el mismo escenario con los cinco **es** el contenido didáctico: el eje exactitud↔coste se ve con los propios ojos, y el conocido "problema del borde" de la ventana fija se demuestra con un test, no con una afirmación.
+
+
+
+## G. Las tres implementaciones detrás de una interfaz
+
+```java
+public interface RateLimiter {
+    Decision decide(Request request);
+}
+
+public record Request(String key, String endpoint, int cost) {}
+
+public record Decision(boolean allowed, long limit, long remaining,
+                       Duration resetIn, String reason) {}
+```
+
+La interfaz es **estrecha y sin fugas**: no expone `RedisTemplate`, ni `EntityManager`, ni `Connection`. Si algo de eso aparece en la firma, la abstracción ya se ha roto y las mediciones dejan de ser comparables entre sí.
+
+| | `InProcessRateLimiter` | `PostgresRateLimiter` | `RedisRateLimiter` |
+|---|---|---|---|
+| **Estructura** | `ConcurrentHashMap` + `LongAdder`, ventanas con reloj monótono | tabla de cubos, una sentencia `INSERT … ON CONFLICT … RETURNING` | claves con TTL, contadores, ZSET y **scripts Lua** |
+| **Atómico** | sección crítica con `compute()` o lock | sí: una sola sentencia | sí: Lua se ejecuta sin interrupción |
+| **Multi-instancia** | ❌ no | ✅ sí | ✅ sí |
+| **Sobrevive un reinicio** | ❌ no | ✅ sí |  depende de cómo se configure la persistencia |
+| **Enseña en Java** | concurrencia en el JVM, coste real del lock, `LongAdder` frente a `AtomicLong` | JDBC/JPA, `ON CONFLICT`, contención, transacciones cortas | `StringRedisTemplate`, `DefaultRedisScript`, pool de conexiones |
+| **Enseña en la práctica** | por qué "no necesito nada más" es tantas veces la respuesta correcta | por qué la durabilidad se paga en latencia | por qué Redis es *la* respuesta a "varios procesos comparten el límite" |
+| **Su límite** | no comparte estado entre procesos | fila caliente → contención; bloat y vacuum | un solo hilo, RAM, no durable por defecto |
+
+**Las tres se validan contra el mismo contrato de tests.** Un mismo test de exactitud y un mismo test de concurrencia corren contra las tres implementaciones (misma clase abstracta, tres subclases con su configuración). Si un adaptador no los pasa, no es una implementación válida: es una fuente de conclusiones falsas.
+
+## H. Roadmap por fases
+
+```text
+P0   Fundación y renombrado: monorepo, perfiles, ADRs, compose            ✔ hecho
+P1   Dominio + API de claves y escenarios de cuota (REST + JPA + Flyway)
+P2   RateLimiter en memoria + filtro + cabeceras RateLimit + 429
+P3   RateLimiter en Postgres (cubos atómicos) + fail-open/fail-closed
+P4   Redis entra en juego: INCR/EXPIRE → ZSET → conteo ponderado → token bucket en Lua
+P5   El instrumento: runner en proceso aparte, warmup, percentiles, modos M1/M2/M3
+P6   La corrida como dato: persistir perfil, resultado y entorno; repetibilidad
+P7   El veredicto: motor de conclusiones sobre la corrida + informe descargable
+P8   Frontend: claves, comparador en vivo por SSE, informe
+P9   Redis a fondo: SLOWLOG, MEMORY USAGE, eviction, picos por BGSAVE, hot keys
+P10  Docker (5 servicios), smoke test, CI, demo grabada y README de portfolio
+```
+
+**Orden elegido y por qué:**
+
+- **Los tres limitadores antes que el instrumento de medida (P2→P4, luego P5).** Construir primero un medidor provisional y reescribirlo después es el camino a un benchmark de juguete. El instrumento se construye **una vez**, cuando ya existen las tres cosas que debe medir.
+- **El frontend al final (P8).** Ya se domina Next/React; el aprendizaje está en Java, Spring y Redis. Poner el frontend al final evita reescribir UI cada vez que cambie el contrato, y el contrato se congela antes porque los tests de P1-P7 **son** el contrato.
+- **Redis entra cuando hay algo que comparar (P4)**, no antes: así cada primitiva de Redis (contador con TTL, ZSET, Lua) resuelve un problema que ya existe, en lugar de ser una pieza colocada por adelantado.
+- **`fail-open`/`fail-closed` en P3**, cuando ya hay un backend que se puede caer a propósito y un test que lo demuestra.
+
+**Gate de cada fase:** no se pasa a la siguiente hasta que `mvn clean verify` esté verde con los tests de esa fase escritos. Ninguna fase se cierra con tests pendientes.
+
+## I. Detalle de las fases
 
 Cada fase incluye: Objetivo · Motivación · Nuevos conocimientos · Tecnologías · Implementación · Resultado verificable · Criterios de aceptación · Riesgos · Qué NO hacer todavía.
 
 ---
 
-### FASE 1 — Fundación: JDK, Maven, monorepo y primer Spring Boot
+### FASE P0 — Fundación y renombrado ✔ completada
 
 **Objetivo**
-Dejar preparado el entorno de desarrollo Java y el repositorio de trabajo: JDK 21, Maven, estructura multi-app, Spring Boot hello world, Docker Compose con Postgres y Redis, y decisiones de diseño documentadas.
+Monorepo limpio bajo el nombre definitivo, con el proyecto Spring Boot arrancando en dos perfiles (`api` y `runner`), el compose de Postgres y Redis, y las decisiones iniciales escritas como ADR.
 
-**Motivación**
-El resto de fases tropiezan sin una base común clara. Instalar Java/Maven y configurar el monorepo desde el inicio evita fricciones persistentes. Es barato si se hace ahora y cara si se hace tarde. Docker Compose con Postgres+Redis se anticipa a F3 (necesita Postgres) y F7 (necesita Redis).
-
-**Nuevos conocimientos**
-- **JDK 21 LTS**: instalación en Windows, `JAVA_HOME`, `PATH`, versiones LTS vs feature.
-- **Apache Maven**: `pom.xml`, dependencias, plugins, `spring-boot-starter-*`, Maven Wrapper.
-- **Spring Boot**: `@SpringBootApplication`, `@RestController`, `@GetMapping`, autoconfiguration, `application.yml`.
-- Convenciones de un monorepo de servicios: una app por proceso, invariantes de `.gitignore`, comandos reproducibles.
-- **Spring Profiles**: `application-api.yml`, `application-worker.yml` — los dos entrypoints del mismo proyecto.
-
-**Tecnologías**
-- Eclipse Temurin **JDK 21 LTS** (u otra distribución LTS).
-- Apache **Maven 3.9.x** (o Maven Wrapper).
-- **Spring Boot 4.1.x** (OSS actual, soporta Java 17–26). *Nota: mencionaste 3.3.x inicialmente, pero 3.5.x ya está EOL desde junio 2026. Se recomienda 4.x para un portfolio de 2026.*
-- `create-next-app` con TypeScript + Tailwind — ya dominado, sirve de esqueleto.
-- Git (init + push a GitHub). Repo público desde el inicio.
-
-**Implementación**
-Estructura base:
-
-```
-repovisor/
-  apps/
-    web/          # Next.js (React + Tailwind + TypeScript)
-    backend/      # Spring Boot (Java 21, Maven) — API + Worker (dos profiles)
-      pom.xml
-      mvnw / mvnw.cmd
-      src/main/java/com/repovisor/
-        RepovisorApplication.java
-        api/
-          AnalysisController.java   # @RestController, GET /healthz
-      src/main/resources/
-        application.yml
-        application-api.yml
-        application-worker.yml
-  docs/
-    PLAN.md        # este documento
-    decisions/     # ADR ligeros (1 por decisión importante, textual, breve)
-  .github/workflows/  # (esqueleto; CI real en F10)
-  .gitignore
-  README.md
-```
-
-Comandos relevantes (Windows/PowerShell):
-- Instalar JDK: `winget install EclipseAdoptium.Temurin.21.JDK` (o descarga manual desde adoptium.net).
-- Instalar Maven: `winget install Apache.Maven` (o descarga manual; añadir a `PATH`).
-- Verificar: `java -version`, `mvn -version`.
-- Crear el proyecto Spring Boot con **Start Spring IO** o Spring Initializr (bootstrap), o `pom.xml` a mano con `spring-boot-starter-web`.
-- `mvn spring-boot:run` → endpoint `GET /healthz` en `http://localhost:8000`.
-- `npx create-next-app@latest apps/web` (App Router, TypeScript, Tailwind).
-- `docker compose up -d` con compose mínimo (postgres, redis, healthchecks).
-- `git init`, `git add`, `git commit`, push a GitHub (repo público).
+**Qué se hizo**
+- Eliminado el dominio anterior (`com.repovisor.mock`) y todo el código muerto del proyecto descartado. **Se eliminó también el build roto**: la clase `AnalysisNotFoundException` no existía y `mvn compile` daba un falso verde porque no recompilaba clases sin cambios.
+- Renombrado a `throttle-mini-lab`: `artifactId`, `name`, paquete base `com.throttlelab`, clase principal `ThrottleLabApplication`, nombres de contenedor y proyecto de compose, base de datos y usuario de Postgres, README y remote de git.
+- `application.yml` con perfil por defecto `api`; `application-api.yml` fija el puerto 8000; `application-runner.yml` arranca **sin servidor web** (`web-application-type: none`).
+- `HealthController` extraído a `com.throttlelab.api` y devolviendo un `Map` (antes era una cadena JSON escrita a mano, dentro de la clase principal).
 
 **Resultado verificable**
-- `mvn spring-boot:run` arranca la API y `GET /healthz` devuelve `{"status": "ok"}` en `http://localhost:8000`.
-- `apps/web` sirve la página por defecto en `http://localhost:3000`.
-- `docker compose up -d` levanta Postgres (puerto 5432) y Redis (puerto 6379) con healthchecks verdes.
-- `mvn compile` y `mvn package -DskipTests` pasan sin errores.
-- Repo subido a GitHub; README con comandos de desarrollo.
-
-**Criterios de aceptación**
-- Se puede clonar el repo en una máquina limpia con JDK 21 + Maven + Docker y arrancar api y web con los comandos documentados (menos de 5 pasos).
-- El profile `worker` arranca sin errores (aunque no haga nada todavía).
-- Las decisiones anotadas como "ADR" en F1 quedan escritas: layout monorepo, api+worker mismo proyecto, JSONB para artefactos, Postgres como fuente de verdad de estado, transporte por tarball.
-
-**Riesgos**
-- Problemas de `JAVA_HOME` / `PATH` en Windows → documentar explícitamente y verificar con `java -version` y `mvn -version`.
-- Sobrediseñar el monorepo (workspaces npm, paquetes compartidos). Antídoto: un solo app web, un proyecto Spring Boot, zero fricción innecesaria.
-- Dispersarse con la configuración de Spring Boot/Next.js. No: es esqueleto.
-- Retrasarse escribiendo README/política del repo. README corto.
+- `mvn clean verify` verde; `contextLoads` pasa.
+- `./mvnw spring-boot:run` → `GET http://localhost:8000/healthz` responde `{"status":"ok"}`.
+- `./mvnw spring-boot:run -Dspring-boot.run.profiles=runner` arranca y **no abre ningún puerto**.
+- `docker compose config` válido; `docker compose up -d` levanta `throttle-mini-lab-postgres` y `throttle-mini-lab-redis` con healthchecks verdes.
 
 **Qué NO hacer todavía**
-- JPA, Flyway, modelos de dominio, análisis, Redis Streams, AI, auth.
-- Tests formales, CI, contratos de API definitivos.
-- Definir el schema de la API de diseño: solo el `GET /healthz` de vida.
+- JPA, Flyway, limitadores, comparador, frontend, Actuator, SSE.
 
 ---
 
-### FASE 2 — Frontend mínimo: formulario + polling de estado
+### FASE P1 — Dominio y API de claves y cuotas
 
 **Objetivo**
-Primera experiencia usable: el usuario pega una URL, se crea el análisis y la UI muestra el progreso por polling. El backend devuelve datos mock (el API real llega en F3).
+La API con persistencia real: entidades `ApiKey` y `QuotaScenario`, migraciones Flyway, endpoints REST de creación/consulta/revocación, validación y contrato de errores. El sistema todavía **no limita nada**.
 
 **Motivación**
-El producto es asíncrono; la UX de "estado avanzando" es el corazón del anteproyecto. Construir el frontend ahora (ya lo dominas) da feedback inmediato y fuerza el diseño del contrato web↔API antes de complicar el backend. Es un "win rápido" antes de sumergirte en Java.
+Sin dominio no hay nada que limitar. Esta fase es donde se aprende Spring Boot en serio (DI, JPA, Flyway, validación, errores) **sin la complejidad de la concurrencia y de Redis encima**. Se hace primero porque es lo más cercano a lo ya conocido y lo que permite que las fases siguientes tengan sobre qué trabajar.
 
 **Nuevos conocimientos**
-- Enrutado de Next.js App Router para flujos de 2 niveles (home + página de detalle con id dinámico).
-- Política de fetch client-side, estados de carga/error/vacío, retry y `refetchInterval` (degradado a manual).
-- Por qué **polling ahora y no SSE**: mecánica ya dominada por ti, destruye complejidad de transporte; SSE queda reservado como mejora de producto post-MVP (F13). Es una decisión consciente, documentable en entrevista.
+- **Java moderno**: `record` para DTOs, `Optional`, streams, `List.of()`, `sealed` para resultados, `var` con criterio.
+- **Spring Boot en serio**: `@Service`, `@Repository`, `@RestController`, inyección por constructor (nunca `@Autowired` en campos), `@ConfigurationProperties`, `@Validated`.
+- **Spring Data JPA**: `JpaRepository`, `@Entity`, `@Id`, `@GeneratedValue`, `@Enumerated`, `@Column(columnDefinition = "jsonb")`, `@JdbcTypeCode(SqlTypes.JSON)`, `Optional<T>` en los `findBy`.
+- **Flyway**: `V1__…sql`, migraciones reproducibles, `ddl-auto: validate` (el esquema lo define Flyway, no Hibernate).
+- **Validación**: `spring-boot-starter-validation`, `@Valid`, `@NotBlank`, `@Min`, y un `@RestControllerAdvice` con un **cuerpo de error estable** (mismo formato para 400, 404 y 409).
+- **UUID nativo de Postgres** y columnas **JSONB** desde Java.
+- **Jackson** en el borde HTTP: `@JsonProperty`, `@JsonInclude`, `Instant` en ISO-8601, y por qué no se serializan entidades JPA directamente.
 
 **Tecnologías**
-- `@tanstack/react-query` (o fetch + estado manual; se recomienda react-query por su gestión de polling/caché/retry). Si prefieres control total, fetch manual es válido; elige uno y sé consistente.
-- Tailwind para el esqueleto; sin librería de UI todavía.
+`spring-boot-starter-data-jpa`, `spring-boot-starter-validation`, `spring-boot-starter-flyway`, `flyway-core`, `flyway-database-postgresql`, `postgresql`, `spring-boot-starter-data-jpa-test`.
 
 **Implementación**
-- Página `/` (home): input de URL + botón "Analizar" → `POST /api/v1/analyses` → redirige a `/analyses/[id]`.
-- Página `/analyses/[id]`: muestra repositorio, badge de estado, etapa actual (queued → cloning → scanning → analyzing_deps → building → completed → failed), último error si `failed`, y refresco automático cada 2–3 s. Zona "placeholder" donde entrarán el mapa y el onboarding.
-- Página `/analyses`: listado de análisis previos (reutiliza `GET /api/v1/analyses`), clic abre uno. Es barata ahora y ya da valor de producto.
-- Estados: loading, error de red, 400/404 con copia clara, botón reintentar manual.
-- Backend mock: el controller devuelve una lista en memoria (no persistida) o datos hardcodeados. La persistencia real llega en F3.
-- `.env.local` con la URL de la API (proxy Next opcional a `/api` propio del backend, decisión mínima).
+- Entidades `ApiKey` (`id`, `keyHash`, `scenario`, `status`, `createdAt`, `revokedAt`) y `QuotaScenario` (`name`, `requestsPerSecond`, `burst`, `dailyQuota`, `weights` JSONB, `failurePolicy`).
+- **La clave no se guarda en claro**: se persiste un hash y la clave en claro se muestra **una sola vez** en la respuesta de creación. Es el comportamiento real y evita un error clásico.
+- `ApiKeyRepository`, `QuotaScenarioRepository`, servicios y mapper *función pura* entidad→DTO (sin MapStruct todavía).
+- Endpoints: `POST /v1/keys` (devuelve la clave en claro una vez), `GET /v1/keys`, `GET /v1/keys/{id}`, `DELETE /v1/keys/{id}` (revocar), `POST/GET /v1/scenarios`.
+- Migración `V1__create_api_key_and_quota_scenario.sql` con **datos iniciales** de escenarios (`holgado`, `ajustado`, `rafaga_corta`) para no arrancar en vacío.
+- `spring.datasource` y Flyway en `application.yml` con variables de entorno y valores por defecto locales.
+- CORS para el futuro frontend en `:3000`.
 
 **Resultado verificable**
-- Flujo: pegar `https://github.com/owner/repo` → se crea → navega a detalle → el badge muestra `queued` (o la etapa que corresponda) y se actualiza solo.
-- El listado permite reabrir análisis previamente creados.
-- Con un `POST` mock que devuelve `{id, status:"completed"}` en 2 s, la UI muestra la transición de estado.
+- `curl -X POST localhost:8000/v1/keys` devuelve 201 con la clave y su escenario; `GET /v1/keys` la lista **sin** la clave.
+- URI inválida → 400 con el mismo formato de error que el resto.
+- Id inexistente → 404 con el mismo formato.
+- Desde esquema vacío (`DROP SCHEMA public CASCADE`), reiniciar la API recrea todo y siembra los escenarios.
 
 **Criterios de aceptación**
-- Las 3 pantallas (form, detalle, listado) navegan sin errores con datos mock de la API.
-- La página de detalle de un id inexistente muestra 404 con opción de volver.
-- Los estados del pipeline (queued/cloning/scanning/analyzing_deps/building_architecture/completed/failed) ya se mapean a labels visibles aunque aún no lleguen del worker.
+- `ddl-auto: validate` en verde: si una entidad y el SQL se desincronizan, el arranque falla (no se permite divergencia silenciosa).
+- La clave no aparece nunca en claro salvo en la respuesta de creación (comprobado con un test).
+- `mvn clean verify` verde con los tests de la fase.
 
 **Riesgos**
-- Sobrediseñar UI (componentes, animaciones, tema) demasiado pronto. La UI de verdad llega en F6/F13.
-- Estado asíncrono mal gestionado en React (carreras, updates fuera de orden). React Query mitiga la mayor parte.
+- Trampas de JPA (lazy loading, transacciones fuera de contexto) → `@Transactional(readOnly = true)` en lecturas, sin relaciones perezosas en el MVP.
+- Flyway no autogenera migraciones: revisar el SQL antes de aplicarlo.
+- Spring Boot 4 usa `jakarta.*`; los tutoriales antiguos con `javax.*` no sirven.
 
 **Qué NO hacer todavía**
-- React Flow, SSE, mapa, onboarding, auth, persistencia local ni caché offline.
+- Rate limiting, Redis, comparador, runner, frontend, Actuator, seguridad de verdad (las claves son de prueba).
 
 ---
 
-### FASE 3 — Java + Spring Boot REST API: persistencia con JPA + Flyway
+### FASE P2 — El primer limitador: en memoria
 
 **Objetivo**
-Construir la API con persistencia real: modelo `Analysis` como entidad JPA, migraciones Flyway, endpoints CRUD (crear y consultar estado), y configuración 12-factor. El frontend de F2 se conecta a datos reales.
+Definir la interfaz `RateLimiter` y su primera implementación (contadores en el heap), aplicarla con un filtro a los endpoints, y devolver cabeceras `RateLimit-*` y `429` cuando corresponda. **El sistema empieza a limitar de verdad.**
 
 **Motivación**
-Nada de lo siguiente funciona sin un lugar donde persistir el estado del análisis. Postgres es la fuente de verdad de todo el producto; Spring Boot es el contrato público. Esta fase es donde aprendes Java/Spring de verdad: DI, JPA, Flyway, profiles, configuración.
+Es el limitador más simple y permite aprender el concepto **sin infraestructura**: si no se puede hacer bien en memoria, no se hará bien en Redis. Además establece el **contrato de tests** (exactitud + concurrencia) que las otras dos implementaciones deberán cumplir.
 
 **Nuevos conocimientos**
-- **Java moderno esencial**: records (DTOs), text blocks, pattern matching, `Optional`, streams, `List.of()`/`Map.of()`, varargs.
-- **Spring Boot en serio**: `@Component`, `@Service`, `@Repository`, construction injection (sin `@Autowired` en campos), `@ConfigurationProperties`, profiles, `@Profile("api")` vs `@Profile("worker")`.
-- **Spring Data JPA**: `JpaRepository`, `@Entity`, `@Table`, `@Id`, `@GeneratedValue`, `@Column(columnDefinition = "jsonb")`, `@JdbcTypeCode(SqlTypes.JSON)`, `@Enumerated`, `Optional<T>`, query methods.
-- **Flyway**: `V1__create_analysis.sql`, migraciones incrementales reproducibles.
-- **application.yml**: configuración 12-factor por variables de entorno, perfiles, datasources.
-- Columnas **UUID** y **JSONB** en Postgres desde Java.
-- Modelado de un **estado finito con enum**: `AnalysisStatus` (QUEUED → CLONING → SCANNING → ANALYZING_DEPS → BUILDING_ARCHITECTURE → COMPLETED | FAILED).
+- **Concurrencia en el JVM**: `ConcurrentHashMap.compute()` y `merge()`, `LongAdder` frente a `AtomicLong`, secciones críticas y el coste real de un lock.
+- **El reloj**: por qué `System.currentTimeMillis()` no sirve para medir intervalos (salta con la hora del sistema) y hace falta un reloj monótono **inyectable**, para que los tests no dependan de `Thread.sleep`.
+- **Filtros de Spring**: `OncePerRequestFilter`, orden de filtros, cómo se escriben cabeceras y cómo se corta una respuesta.
+- **Errores HTTP**: `429 Too Many Requests`, `Retry-After`, y las cabeceras del borrador IETF `RateLimit-Limit` / `-Remaining` / `-Reset`.
+- **Intercambiabilidad por configuración**: `@ConditionalOnProperty` para elegir la implementación **sin tocar el código que la usa**.
+- **Tests de concurrencia**: `ExecutorService` + `CountDownLatch`, y por qué son deterministas (dependen de un conteo, no de un tiempo).
 
 **Tecnologías**
-- `spring-boot-starter-web`, `spring-boot-starter-data-jpa`.
-- `postgresql` (runtime), `flyway-core`, `flyway-database-postgresql`.
-- Jackson (viene con Spring Boot) para serialización JSONB.
-- (Opcional) `springdoc-openapi` para Swagger UI; si no, Insomnia/curl bastan.
+`spring-boot-starter-webmvc`, JUnit 5, AssertJ, `@WebMvcTest` + MockMvc.
 
 **Implementación**
-- Entidad `Analysis`: `id` (UUID), `repoUrl`, `owner`, `name`, `status` (enum), `stage` (enum), `error` (nullable), `createdAt`, `updatedAt`, más columnas JSONB vacías que se rellenarán en fases posteriores (structure, modules, edges, dependencies, meta, aiDocs).
-- `AnalysisRepository extends JpaRepository<Analysis, UUID>`.
-- `AnalysisService` con lógica de creación y consulta.
-- `AnalysisController`:
-  - `POST /api/v1/analyses` — valida la URL de GitHub (regex + formato `owner/repo`), crea fila con status `QUEUED`. Devuelve `201/202`.
-  - `GET /api/v1/analyses/{id}` — devuelve análisis con estado y etapa actual.
-  - `GET /api/v1/analyses` — lista de los últimos N con paginación simple.
-- Migración Flyway `V1__create_analysis.sql` (tabla `analysis`).
-- `application.yml` con datasource, JPA (ddl-auto `validate`), Flyway, profiles.
-- DTOs con records Java; mapeo con un mapper simple (sin MapStruct todavía).
-- Validación de repositorio: que sea `github.com/owner/repo`, no ejecuta nada todavía.
-
-Comandos relevantes:
-- `docker compose up -d postgres` (desde el compose inicial de F1).
-- `mvn spring-boot:run --spring-boot.run.profiles=api` → Flyway crea la tabla en arranque.
-- Probar con curl / REST Client / Insomnia.
+- `RateLimiter` (interfaz) + `RateLimitRequest` y `RateLimitDecision` (records) — ver sección G.
+- `InProcessRateLimiter`: ventana deslizante por clave con `ConcurrentHashMap`, aplicando el peso del endpoint.
+- `RateLimitFilter`: extrae la clave, resuelve el escenario de cuota, decide, añade cabeceras y, si toca, responde `429` sin llegar al controlador.
+- Selección por configuración: `throttlelab.limiter.type = in-process | postgres | redis`.
 
 **Resultado verificable**
-- `POST /api/v1/analyses` con una URL válida crea una fila; `GET` la devuelve; la lista funciona.
-- Desde cero: `DROP SCHEMA public CASCADE` en Postgres → reiniciar API → Flyway recrea la tabla.
-- Frontend de F2 conectado a datos reales: el badge muestra `queued` persistido.
+- Con límite 10/s: las 10 primeras → 200 con `RateLimit-Remaining` decreciente; la 11 → 429 con `Retry-After`.
+- Pasada la ventana, vuelve a permitir.
+- Endpoints de distinto peso consumen cupo distinto.
 
 **Criterios de aceptación**
-- Migraciones reproducibles desde un esquema vacío.
-- URL inválida → `400` con mensaje claro; URL inexistente en GitHub se validará solo en F4 (el pipeline).
-- Records, Optional y streams tipados; `mvn compile` sin errores.
-- El enum de estados incluye `analyzingDeps` y `buildingArchitecture` (los usa F4+).
+- **Test de concurrencia**: 100 hilos contra un límite de 10 → **exactamente 10 permitidas y 90 rechazadas**. Es el test que demuestra atomicidad.
+- **Test de exactitud**: con un patrón conocido, se permiten exactamente las peticiones del modelo matemático de la ventana.
+- Test de cabeceras y de `429` con el formato de error común.
+- Test con reloj simulado: instantáneo y determinista, sin `Thread.sleep`.
 
 **Riesgos**
-- Trampas de JPA (lazy loading, N+1, sesiones fuera de contexto). Antídoto: `@Transactional(readOnly = true)` en lecturas y consultar con `Pageable` o `List<Analysis>` sin relaciones en el MVP.
-- Flyway no "autogenera" migraciones como Alembic — las migraciones son SQL manuales. Más control, menos magia; revisar SQL antes de aplicar.
-- Spring Boot 4.x usa el namespace `jakarta.*` (no `javax.*`). Los tutoriales viejos usan `javax` — confusión potencial. Buscar siempre "Spring Boot 4" o "Jakarta EE".
-- UUID como ID: decidir si se guarda como `UUID` nativo en Postgres (recomendado) o como string.
+- Limitar **por IP en vez de por clave**: funcionaría en la demo y no probaría nada.
+- Usar el reloj equivocado y obtener ventanas erráticas.
+- Escribir el estado sin protección y pasar el test de exactitud pero **fallar el de concurrencia**: es justo lo que los dos tests juntos detectan.
 
 **Qué NO hacer todavía**
-- Redis, colas, worker, análisis real, AI, auth.
-- Normalizar tablas de artefactos (se decidió JSONB).
-- Endpoints de "admin" ni borrar análisis.
+- Postgres, Redis, métricas, percentiles, runner, frontend.
 
 ---
 
-### FASE 4 — Análisis determinista #1: clone + scan + JavaParser
+### FASE P3 — El limitador en Postgres
 
 **Objetivo**
-Primer análisis real: el endpoint `POST /analyses` ejecuta un pipeline sincrónico que clona el repo (tarball), escanea archivos, analiza código Java con JavaParser, y persiste el artefacto JSONB en Postgres.
+`PostgresRateLimiter`: el mismo límite de P2, pero con el estado en una tabla, compartido entre instancias y durable. Más la política de fallo `fail-open` / `fail-closed`.
 
 **Motivación**
-El corazón del producto es el análisis de código. Esta fase construye la columna vertebral determinista: clonar, escanear, parsear. El análisis corre **sincrónicamente** en el handler de la petición (la API bloquea durante el análisis). Esto es aceptable para repos pequeños en desarrollo; en F7 se moverá a un worker asíncrono.
+Responde a "¿y si no quiero añadir un servicio?". Y enseña, midiendo, por qué la durabilidad **se paga** en latencia: es el primer punto donde la comparación tiene un ganador en el eje del coste y otro en el de la garantía.
 
 **Nuevos conocimientos**
-- Clonado **sin git**: descargar `tarball` de `codeload.github.com` y extraer a un directorio temporal con `java.nio.file.Files` + un descompresor GZIP/TAR (Apache Commons Compress o librería equivalente).
-- **Guardrails de recursos**: límite de tamaño de repo, nº total de archivos, tamaño por archivo, timeout total. Rechazos con error claro y estado `FAILED`.
-- Seguridad: extracción de tar de forma segura (evitar path traversal), uso de `Files.createTempDirectory`, limpieza en `finally`.
-- Escaneo: walk del árbol con `Files.walk()`, filtrado por extensión de interés (`.java, .ts, .tsx, .js, .jsx, .json, .toml, .gradle, .md…`), exclusión de `node_modules`, `dist`, `.git`, `.venv`, archivos minificados. Conteos por carpeta y LOC por archivo.
-- **JavaParser** (`javaparser-symbol-solver-core`): parsear archivos `.java` a AST, extraer paquetes, clases, interfaces, imports, métodos, dependencias entre paquetes.
-- Estructura del artefacto JSON: `modules`, `nodes`, `edges`, `statistics`, `languages`, `meta`.
-- Consumo de HTTP en Spring con **RestClient** (reemplaza httpx): `RestClient`, `RestClient.Builder`, manejo de errores.
+- **Atomicidad en una sentencia**: `INSERT … ON CONFLICT … DO UPDATE … RETURNING`, que resuelve "leer y luego escribir" sin transacción explícita y sin carrera.
+- **`SELECT … FOR UPDATE`** y bloqueo por fila: se implementa como variante **a propósito**, para poder **provocar la contención** y medirla.
+- **Aislamiento y contención**: qué ocurre cuando muchos hilos escriben en la misma fila; qué son los *lock waits*.
+- **Bloat y `autovacuum`**: las escrituras repetidas generan versiones muertas; se ven en `pg_stat_user_tables`.
+- **Migración de cubos**: por qué el estado del limitador no puede crecer sin fin y cómo se limpia.
+- **`pg_stat_statements`**: medir el coste real de las sentencias en vez de suponerlo.
+- **El pool es el techo**: HikariCP, tamaño del pool, y por qué 200 hilos contra un pool de 10 no miden a Postgres, miden el pool.
 
 **Tecnologías**
-- `com.github.javaparser:javaparser-symbol-solver-core` (3.26.x — soporta Java 1–25).
-- Apache Commons Compress (o lib simplificada) para el tarball.
-- `RestClient` (Spring) para codeload.
-- Jackson (viene con Spring Boot) para construir el artefacto JSON.
+`JdbcTemplate` para las sentencias atómicas, Flyway, Testcontainers **Postgres** (`spring-boot-testcontainers` + `org.testcontainers:postgresql`).
 
 **Implementación**
-- `CloneService`: descarga tarball de `https://codeload.github.com/{owner}/{name}/tar.gz/{branch}`, extrae a temp dir, valida estructura mínima, aplica límites.
-- `ScannerService`: `Files.walk()`, filtrado, métricas (LOC por archivo, archivos por directorio, top archivos, lenguaje por extensión).
-- `JavaParserService`: parsea cada archivo `.java`, extrae package, class/interface names, imports, method count, LOC, y dependencias entre paquetes del mismo repo.
-- `ArtifactBuilder`: agrega resultados en el artefacto JSON (schema definido en F1/ADR).
-- `AnalysisService.analyze()` orquesta: validate → set CLONING → clone → set SCANNING → scan → parse → build artifact → persist JSONB → status COMPLETED. Cualquier excepción → `FAILED` con `error` claro.
-- Estados: `QUEUED → CLONING → SCANNING → COMPLETED | FAILED`.
-- Limpieza del directorio temporal vía `finally`.
+- Tabla `rate_limit_bucket` (`key`, `window_start`, `counter`, PK compuesta) con su migración Flyway.
+- `PostgresRateLimiter` con `INSERT … ON CONFLICT … RETURNING` en una sola sentencia; variante `FOR UPDATE` seleccionable por configuración para el experimento de contención.
+- Barrido de cubos caducados (periódico o `DELETE` en la propia sentencia).
+- `failurePolicy` (`OPEN`/`CLOSED`) aplicada cuando la consulta falla, con **test que corta el acceso a Postgres** y verifica ambas políticas.
 
 **Resultado verificable**
-- Submit de un repo Java real (pequeño, propio o de ejemplo) → la API ejecuta el análisis → en logs se ven `cloning` y `scanning` → Postgres tiene `structure` JSONB con árbol de carpetas, archivos, tamaños, LOC y módulos Java.
-- Submit de un repo gigante → `FAILED` con mensaje claro de límite superado en vez de colgar.
-- Submit simultáneo de 2-3 repos → se procesan secuencialmente (sincrónico) sin romper.
+- Los mismos tests de exactitud y concurrencia de P2 pasan con este adaptador (misma clase abstracta, otra subclase).
+- Cortar Postgres: con `OPEN` las peticiones siguen pasando; con `CLOSED` se rechazan. Ambos casos con test.
+- La tabla se estabiliza tras N ventanas en vez de crecer sin límite.
 
 **Criterios de aceptación**
-- Estado final correcto en Postgres para éxito y para cada error probado.
-- Los archivos `.java` se parsean con JavaParser: paquetes, clases, imports extraídos correctamente.
-- Sin dependencia de ningún servidor externo más allá de codeload + tu repo de prueba.
-- `mvn compile` sin errores; logs estructurados con el stage.
+- Exactamente 10 de 100 permitidas, ahora con Testcontainers.
+- El barrido deja la tabla estabilizada.
+- Contar las sentencias por decisión: **una**, no dos.
 
 **Riesgos**
-- Empezar a resolver imports entre módulos antes de tiempo en esta fase. NO: la resolución a nivel módulo se completa en F5.
-- El clon tarball falla por rate limit de GitHub → se maneja como fallo transitorio (F9); por ahora basta log claro.
-- Spaghetti en el pipeline → mantener funciones limpias y una orquestadora explícita. No introducir ninguna librería de pipelines todavía.
-- JavaParser con sintaxis rota en un archivo → catch y continuar, registrar el error, nunca abortar todo el análisis.
+- Medir con un pool demasiado pequeño y **culpar a Postgres** de un límite que es del pool → se declara en el resultado.
+- Olvidar la limpieza de cubos y llenar el disco en una corrida larga.
+- Escribir dos sentencias (leer y luego escribir) y reintroducir la carrera que este adaptador debe evitar.
 
 **Qué NO hacer todavía**
-- tree-sitter, dependencias de manifests, metadata GitHub, grafo de imports entre módulos, AI.
-- Redis, colas, worker, reintentos automáticos (F9), rate limiting (F9), SSE.
-- Ejecutar ningún código del repositorio analizado.
+- Redis, runner, veredicto, frontend.
 
 ---
 
-### FASE 5 — Análisis determinista #2: tree-sitter + dependencias
+### FASE P4 — El limitador en Redis
 
 **Objetivo**
-Ampliar el pipeline con análisis de TypeScript/JavaScript (tree-sitter), parsing de manifests de dependencias, detección de framework, y metadatos de GitHub. El artefacto JSONB se enriquece con edges, dependencias y frameworks.
+`RedisRateLimiter` con **cuatro estrategias** implementadas de forma progresiva: contador con TTL, registro deslizante (ZSET), contador ponderado y token bucket en Lua. Y la demostración, con tests, de en qué se equivoca cada una.
 
 **Motivación**
-El mapa y la documentación AI (F8) necesitan contexto: ¿qué lenguaje, qué framework, qué paquetes? El onboarding debe poder decir "es una app React+Spring con estas deps". Todo esto se obtiene programáticamente; la AI solo lo explicará.
+Redis entra aquí porque **ya existe un problema que resolver** (compartir el límite entre procesos) y porque ya hay dos implementaciones con las que compararlo. Es la fase donde Redis se aprende de verdad: sus estructuras, su atomicidad por scripting y su coste en memoria.
 
 **Nuevos conocimientos**
-- **tree-sitter (bonede JVM bindings)**: `io.github.bonede:tree-sitter` (0.26.x) + gramáticas de lenguaje (`tree-sitter-typescript`, `tree-sitter-java`). Parsear TS/TSX/JS/JSX a CST, extraer imports, clases, funciones. Conocer qué es un CST y por qué es mejor que regex.
-- Resolución de imports a **nivel módulo**: definición de "módulo" por lenguaje:
-  - Java: paquete/`package`.
-  - TS/JS: directorio de nivel superior bajo la raíz de código (secundariamente archivos raíz). Cada archivo pertenece a un módulo; los imports relativos se resuelven a su módulo.
-- Agregación: nodo = módulo; edge = relación import→import destino con **count** de frecuencia. External (bare packages sin resolución local) se agrupan en un nodo `external` único o se omiten del grafo pero se listan en stats.
-- Consumo de la **GitHub REST API** con `RestClient`: metadatos de repo (descripción, default branch, lenguaje, stars), manejo del **rate limit** (60 req/h anónimo; 5000 req/h con token opcional vía `GITHUB_TOKEN`).
-- Captura del **commit SHA** (usado en F8 para caching de AI).
-- Parsing de manifests **sin regex ad-hoc**:
-  - `package.json` → Jackson (ya en el stack).
-  - `pom.xml` → Jackson (dataformat XML) o JAXB.
-  - `build.gradle` → parseo básico de texto (scope mínimo).
-- Heurística de framework a partir de dependencias: tablas de coincidencia (React/Next/Express/Fastify · Spring Boot/Django/FastAPI · ASP.NET Core/MVC/EF).
-- Alias (`tsconfig paths`) y workspaces: **fuera de scope** con estadística "unresolved". Decidir en fase: recomiendo fuera, registrando `unresolved_imports` como métrica.
-- Pruebas unitarias deterministas de parsers con **fixtures** (repo de ejemplo en `src/test/resources/fixtures`).
+- **`StringRedisTemplate`** frente a `RedisTemplate` con serializadores, y por qué el serializador por defecto de Java trae problemas.
+- **Claves con TTL**: `SET … PX`, `EXPIRE NX`, expiración perezosa, y por qué una clave sin TTL es una fuga de memoria garantizada.
+- **Estructuras**: contadores (`INCR`), conjuntos ordenados (`ZADD`, `ZREMRANGEBYSCORE`) y el porqué de cada elección.
+- **Scripting Lua**: `DefaultRedisScript`, `EVALSHA`, y **por qué Lua es atómico** (Redis ejecuta el script sin interrupción). Es el punto donde se entiende de verdad qué significa "atómico" en Redis.
+- **El coste por estrategia**: O(1) frente a O(n) por clave; `MEMORY USAGE` para verlo con números.
+- **Un solo round-trip por decisión**: devolver límite, restante y reinicio en la misma llamada al script. Hacerlo en dos llamadas añade una carrera **además** de latencia.
+- **`SCAN` frente a `KEYS`**: por qué `KEYS` no se usa en producción ni para limpiar.
 
 **Tecnologías**
-- `io.github.bonede:tree-sitter` (0.26.x) + gramáticas de lenguaje.
-- `RestClient` (Spring) para GitHub API (ya en el stack).
-- Jackson `jackson-dataformat-xml` (pom.xml) si se prefiere; o `<package> document` con JAXP.
-- JUnit 5 (viene con `spring-boot-starter-test`) para tests unitarios de parsers.
+`spring-boot-starter-data-redis` (Lettuce), Redis 7 (Docker), Testcontainers Redis (`com.redis:testcontainers-redis`), scripts `.lua` como recursos del classpath.
 
 **Implementación**
-- `TreeSitterService`: parsea archivos `.ts/.tsx/.js/.jsx`, extrae imports, clases, funciones, símbolos.
-- `DependenciesService`: parsing de `package.json`, `pom.xml`, `build.gradle` → lista de dependencias `{name, version, kind, file}`.
-- `FrameworkDetector`: tabla de heurísticas → detecta frameworks (Spring Boot, Next.js, React, Express, etc.).
-- `GitHubService`: metadatos del repo (descripción, lenguaje, default branch, commit SHA, stars) vía REST API. Token opcional `GITHUB_TOKEN`; funcionar también sin él.
-- `ModuleResolver`: resuelve imports a módulo (relativos + paquetes locales), `unresolved` como métrica.
-- `GraphAggregator`: genera nodos/edges con counts y capas (api, domain, storage, ui, shared).
-- Extender `ArtifactBuilder` con modules, nodes, edges, dependencies, frameworks, meta.
-- Etapa `ANALYZING_DEPS` + `BUILDING_ARCHITECTURE`.
-- Persistir `analysis.modules`, `analysis.edges`, `analysis.dependencies` (JSONB).
-- Tests unitarios con fixtures para cada parser y formato de manifest.
+- Estrategia seleccionable por configuración: `fixed_window`, `sliding_log`, `sliding_counter`, `token_bucket`.
+- `fixed_window` **primero sin Lua y a propósito**: hay un test que falla porque `INCR` y `EXPIRE` no son atómicos. Se reescribe con Lua y el test pasa. **Ver fallar ese test es el objetivo de aprendizaje de la fase.**
+- `sliding_log`: `ZADD` con marca de tiempo, `ZREMRANGEBYSCORE` para descartar lo viejo y `ZCARD` para contar, todo dentro de un script.
+- `sliding_counter`: dos contadores y la fórmula ponderada, con su error medido y declarado.
+- `token_bucket`: el script completo que devuelve fichas, límite y reinicio. Es la estrategia de referencia.
+- `maxmemory` y política configuradas en el compose, para poder demostrar en P9 qué ocurre cuando Redis desaloja claves del limitador.
 
 **Resultado verificable**
-- Análisis de 3 repos de prueba (Java, TypeScript, mixto) muestra: metadatos correctos, deps detectadas, framework detectado, edges entre módulos.
-- Repos sin manifests completan la etapa con dependencias vacías sin fallar.
-- Tests de fixtures pasan: import relativo (a módulo), import de paquete (→ external), ciclo de imports (no se rompe), archivo sin imports.
+- Las cuatro estrategias pasan el mismo test de exactitud (con la tolerancia declarada en el contador ponderado).
+- **Test dedicado al borde de la ventana**: con ventana fija, una ráfaga al final de una ventana y otra al principio de la siguiente dejan pasar **el doble** del límite. El test lo documenta como comportamiento esperado de esa estrategia, no como fallo.
+- 100 hilos contra límite 10 → exactamente 10 permitidas.
 
 **Criterios de aceptación**
-- Los parsers pasan tests unitarios con fixtures, incluyendo casos límite (JSON malformado, pom.xml vacío, package.json sin deps).
-- El fallo del rate limit de GitHub degrada a "sin metadata" con log claro, **no** hace fallar el análisis.
-- Sin `GITHUB_TOKEN` el flujo sigue funcionando (límite más bajo).
-- Repos enormes no explotan: cap de nº de archivos analizados (config), los que pasan el cap se excluyen con métrica.
-- `unresolved_imports` <= umbral razonable en los repos de prueba, o está documentado por qué no.
+- Un solo round-trip por decisión, verificado contando llamadas.
+- **Ninguna clave se queda sin TTL**: test que recorre las claves del limitador y lo comprueba.
+- `MEMORY USAGE` por estrategia registrado como dato: `sliding_log` crece con el tráfico; las otras no.
 
-**Riesgos** (el más peligroso del proyecto)
-- **Resolver imports "a lo perfecto"** (aliases de tsconfig, monorepos con workspaces, imports de barril, path `@/…`). Esto puede consumir semanas. El plan lo corta explícitamente: se resuelven relativos y paquetes locales; el resto → `unresolved` como métrica. **La "perfección" no aporta valor de producto en el MVP.**
-- tree-sitter en Windows: verificar que los nativos (DLLs) vienen incluidos en el JAR de bonede. Si no, fallback: usar JavaParser solo (Java) y un parser de imports por regex simple para TS como solución documentada.
-- Grafo por archivo con miles de nodos → se agrega a módulo (top-level). Cap global de nodos.
-- Gramáticas TS complejas (JSX, decorators) → scope: imports y declaraciones básicas.
+**Riesgos**
+- **Creer que `INCR` + `EXPIRE` es atómico.** No lo es, y el test lo demuestra.
+- ZSET sin `ZREMRANGEBYSCORE`: la clave crece sin límite y la memoria se dispara.
+- Confundir el error **del algoritmo** con el error **del scripting**: son dos ejes distintos (exactitud del modelo y atomicidad de la ejecución) y hay que medirlos por separado.
 
 **Qué NO hacer todavía**
-- LSP/IntelliSense, dependencias transitivas, resolución de tipos, análisis de imports del bundler, renders server, pruebas ejecutando el código, aliases/workspaces.
-- Consultas a npm/PyPI APIs, resolución de versiones, licencias, vulnerabilidades.
+- Redis Cluster, Pub/Sub, Streams, y `redis-benchmark`: lo que se mide es **nuestro** limitador, no la librería.
 
 ---
 
-### FASE 6 — Visualización interactiva con React Flow ⭐
+### FASE P5 — El instrumento: el runner
 
 **Objetivo**
-Mostrar el grafo de módulos como mapa interactivo: nodos, aristas, capas con color, click para detalle, minimapa y controles. Primera pantalla de valor real del producto.
+El generador de carga en un **proceso aparte sin servidor web**, con warmup, percentiles, los tres modos de medición y distribución uniforme o zipf. Es la única pieza que mide, y se construye **una sola vez**.
 
 **Motivación**
-El producto es "ver la arquitectura". Sin mapa interactivo no hay producto. Además fuerza a definir el contrato de API de arquitectura (`GET /analyses/{id}/architecture`) que la AI (F8) reutilizará.
+Sin instrumento no hay veredicto, solo intuición. Y un instrumento mal hecho produce conclusiones **peores que no tener ninguna**. Por eso esta fase lleva más rigor que código: el código son unas pocas clases; las reglas son lo difícil.
 
 **Nuevos conocimientos**
-- **@xyflow/react (React Flow v12)**: nodos/edges, custom nodes, `handle`, state de selección, `MiniMap`, `Controls`, SSR-safe rendering.
-- Layout de grafos con **dagre** (simple, jerárquico) sobre el grafo dirigido módulo→módulo; entender limitaciones con grafos cíclicos.
-- Mapeo datos (JSONB) → elementos de React Flow; normalización client-side.
-- UX de grafos: legend, color por capa, tamaño de nodo ∝ LOC, filtrado de nodos "external", pan/zoom, fit view.
+- **Generación de carga con *pacing***: no se trata de lanzar peticiones a saco, sino de mantener un ritmo objetivo y medir la **desviación respecto al plan**. Si el generador no puede seguir el ritmo, **eso también es un dato** y hay que reportarlo, no esconderlo.
+- ***Coordinated omission***: el error clásico y silencioso de los benchmarks de latencia. Si el generador solo mide las peticiones que **consiguió** enviar, las que se retrasaron no cuentan y la latencia sale artificialmente baja. Se corrige midiendo desde el instante en que la petición **debía** haberse enviado. Es el concepto que separa un benchmark honesto de uno de blog.
+- **Percentiles de verdad**: histograma de latencias. Se usa **HdrHistogram** (el que usan JMH y los benchmarks serios) y se entiende por qué no basta con media y desviación típica.
+- **Distribución zipf**: generar claves con sesgo realista, no uniforme.
+- **Virtual threads (Java 21)**: concurrencia masiva sin un hilo del sistema por petición, y cuándo conviene frente a un pool clásico.
+- **Instrumentar el propio instrumento**: cuánto consume el generador (CPU, GC) para poder afirmar si él fue el cuello de botella.
 
 **Tecnologías**
-- `@xyflow/react@^12`, `dagre` (layout). Alternativa más potente `elkjs` — se recomienda dagre por simplicidad; elkjs queda como mejora post-MVP.
+`java.net.http.HttpClient` del JDK (menos capas entre el generador y lo medido que un cliente de más alto nivel), `ExecutorService` y virtual threads, **HdrHistogram** (versión explícita: no está en el BOM de Spring Boot), Jackson.
 
 **Implementación**
-- Convención de aristas (decisión de diseño): dirección **"depende de"** — flecha del *importador* al *importado* (`matchService → rankings`). Si "X hace `import` de Y", entonces `X → Y`. Consistente en `edges`, API y React Flow (React Flow permite invertir dirección en el mapa).
-- `GET /api/v1/analyses/{id}/architecture` en Spring Boot (devuelve modules + edges + structure + deps resumidos).
-- Componentes en `apps/web`:
-  - `AnalysisMap` (área React Flow).
-  - `ModuleSidebar` (panel al click: path, LOC, archivos del módulo, deps entrantes/salientes).
-  - `MapHeader` (repo, framework, capas, legend, "volver").
-- Lógica de layout en `lib/map.ts` (JSONB → React Flow).
-- Límites: si > 40 nodos, agrupar/colapsar capas con count (suficiente para MVP); global cap.
-- Integración: el detalle del análisis (`/analyses/[id]`) muestra el mapa cuando está `COMPLETED`; placeholder mientras tanto.
+- `LoadProfile` (record): rps objetivo, claves activas, distribución, duración, warmup, mezcla de endpoints y modo de medición.
+- `LoadGenerator`: mantiene el ritmo, mide **latencia planificada** además de la real (anti-*coordinated omission*), y cuenta permitidas y rechazadas.
+- `LatencyRecorder`: HdrHistogram + extracción de p50/p95/p99/p99.9 y máximo.
+- `RunResult`: cifras + entorno + configuración + commit del código.
+- Los tres modos: **M1** una conexión y una petición a la vez; **M2** N conexiones concurrentes; **M3** el perfil descrito por quien usa la herramienta.
+- **Regla de oro del diseño: el camino medido es el mismo para las tres implementaciones.** Todo pasa por HTTP contra la API y por el filtro real, porque medir unas por HTTP y otras en proceso sería comparar cosas distintas. El sobrecoste de HTTP y de la JVM es **constante para las tres** y por tanto se cancela en la comparación; lo que no se cancele, se declara.
 
 **Resultado verificable**
-- Con un repositorio analizado en F4+F5, el mapa muestra los módulos correctos, aristas de dependencia con dirección, capas coloreadas, y click en un nodo abre detalles desde la API.
+- `./mvnw spring-boot:run -Dspring-boot.run.profiles=runner` genera carga y **no abre ningún puerto**.
+- Con límite 100/s y carga de 100 rps: ~100 % permitidas. Con carga de 300 rps: ~1/3 permitidas y 2/3 rechazadas con `429`.
+- La duración y el warmup se respetan; a 0 rps no se envía nada.
+- M1 y M2 dan latencias visiblemente distintas, y **las dos se reportan**.
 
 **Criterios de aceptación**
-- El mapa se renderiza desde datos reales (no mock) de repos Java y TypeScript sin romper.
-- Navegación: pan, zoom, minimapa, "ajustar a vista", reset. Sin JS crippled states (SSR-safe).
-- Repo con ciclo de imports no provoca layout roto (dagre maneja ciclos, verificarlo).
-- Panel lateral conectado de verdad al nodo seleccionado.
+- **Test de pacing**: las peticiones enviadas difieren del plan en menos del margen declarado.
+- **Test de percentiles**: sobre una muestra de distribución conocida, los percentiles calculados coinciden con el valor esperado.
+- **Test anti-*coordinated omission***: si el servidor se vuelve lento a partir de la petición N, el p99 **detecta** el retraso (un generador sin corrección lo escondería).
+- El modo de medición se guarda en el resultado y **el sistema impide comparar corridas de modos distintos**.
 
 **Riesgos**
-- Personalizar nodos/aspecto más de lo necesario → prefabricar look simple y pulirlo en F13.
-- Layout problemático en grafos densos → cap de nodos y colapso por capa (ya decidido).
-- React Flow + Next SSR: usar el patrón de montar en cliente (dynamic import `ssr: false`) — error típico.
+- **Que el generador sea el cuello de botella** → se instrumenta y se reporta su propio consumo; si satura, se dice.
+- **Coordinated omission** → es *el* riesgo de esta fase, con test específico.
+- Que la API y el runner acaben en la misma máquina sin declararlo → el perfil `runner` existe precisamente para impedirlo por descuido.
+- Usar promedios "porque se leen mejor" → prohibido por el principio rector 5.
 
 **Qué NO hacer todavía**
-- Edición de grafos, drag-to-rearrange persistido, agrupaciones avanzadas, file-level view.
+- Emitir conclusiones automáticas (eso es P6 y P7), UI, y Redis a fondo (P9).
 
 ---
 
-### FASE 7 — Pipeline asíncrono: Redis Streams + worker Spring Boot ⭐
+### FASE P6 — La corrida como dato
 
 **Objetivo**
-Que `POST /analyses` encargue un job **real a un worker asíncrono** que clona el repo y ejecuta todo el pipeline de análisis (F4+F5), mientras la API actualiza el estado en Postgres. Primer flujo asíncrono completo del producto.
-
-**Motivación (arquitectónica)**
-```text
-El análisis tarda segundos/minutos
-        ↓
-no debe bloquear la petición HTTP
-        ↓
-necesitamos un background job
-        ↓
-necesitamos una cola (Redis Streams)
-        ↓
-necesitamos un worker (Spring Boot, segundo proceso)
-```
-Además: **Redis no corre en Windows** → en desarrollo el worker, Redis y Postgres viven en Docker. Esta es la primera necesidad real de Docker para el worker y será la base del **stack reproducible final** (F11/F12).
-
-**Nuevos conocimientos**
-- **Redis Streams**: `XADD` para encolar, `XREADGROUP` con consumer groups para consumir, `XACK` para confirmar, `XAUTOCLAIM` para recuperar jobs colgados (pendientes en la PEL). Conceptos: stream, consumer group, consumer, pending entries list (PEL), dead-letter.
-- **Spring Data Redis `StreamMessageListenerContainer`**: `receive()` con `StreamReceiver` y `ReceiverOptions` (desde el primer id o por grupo), `@Profile("worker")` para el componente consumidor.
-- **Dos entrypoints del mismo proyecto Spring Boot**: `--spring.profiles.active=api` (solo capa web) y `--spring.profiles.active=worker` (solo stream consumer). En Docker: dos contenedores con la misma imagen, diferentes `command`.
-- **Docker Compose 5 servicios**: web, api, worker, redis, postgres + volúmenes + healthchecks.
-- Worker lifecycle: `StreamListener`/`StreamMessageListenerContainer` iniciado con `ApplicationReadyEvent`; graceful shutdown.
-- **Clasificador de excepciones**: transitorio (timeout, 5xx, 429) vs permanente (repo no existe, límite de tamaño, tar corrupta). Retry solo transitorios.
-
-**Tecnologías**
-- `spring-boot-starter-data-redis` (incluye `StreamMessageListenerContainer`).
-- Lettuce es el driver por defecto (viene con el starter).
-- Redis 7.x (Docker; 7+ para `XAUTOCLAIM` con lista de IDs eliminados).
-- `RestClient` (Spring) para clonar tarballs (ya en F4).
-
-**Implementación**
-- `RedisStreamConfig`: configura la conexión Redis, stream `analysis:jobs`, consumer group, `StreamMessageListenerContainer`.
-- `StreamProducer` (en perfil `api`): `XADD` al crear análisis → encola `{analysisId, owner, name, repoUrl, commit}`.
-- `StreamConsumer` (en perfil `worker`): consume del stream, ejecuta el pipeline de análisis (F4+F5), actualiza estado en Postgres, `XACK` al terminar. Excepciones transitorias → no-ack (queda en PEL para recuperación); permanentes → `FAILED` + ack.
-- `POST /api/v1/analyses` ahora escribe al stream y devuelve `202` (ya no bloquea).
-- Estados visibles en la UI: `QUEUED → CLONING → SCANNING → ANALYZING_DEPS → BUILDING_ARCHITECTURE → COMPLETED | FAILED`.
-- `compose.yml` con 5 servicios: `web`, `api`, `worker` (misma imagen, diferente command), `redis`, `postgres`.
-
-Comandos relevantes:
-- `docker compose up --build` (todos los servicios).
-- `docker compose logs -f worker` (ver etapas en vivo).
-- Lanzar análisis desde Swagger UI / frontend y observar el pipeline asíncrono.
-
-**Resultado verificable**
-- Submit de un repo real → la API responde `202` inmediatamente → el worker procesa el job → la UI muestra el progreso por polling → Postgres tiene el artefacto completo.
-- Submit de un repo gigante → `FAILED` con mensaje claro de límite superado en vez de colgar.
-- Matar el worker a mitad del análisis → el job queda en la PEL; al reiniciar el worker, lo recupera (XAUTOCLAIM) o se marca `FAILED` por timeout.
-- Submit simultáneo de 2-3 repos → se procesan en cola sin romper.
-
-**Criterios de aceptación**
-- Estado final correcto en Postgres para éxito y para cada error probado.
-- El worker arranca solo con el profile `worker`, consume del stream, procesa jobs, y hace `XACK`.
-- Matar el worker a mitad de un análisis → la fila queda en estado intermedio consistente (no corrupto); al reiniciar, el job se reintenta.
-- La API (profile `api`) no consume jobs y el worker no expone endpoints HTTP.
-- Logs estructurados en cada transición de estado.
-
-**Riesgos**
-- El worker no arranca porque el stream o el consumer group no existen aún → crearlos en `RedisStreamConfig` al inicializar (idempotente), o `XADD` desde la API garantiza la creación del stream.
-- `XAUTOCLAIM` con Redis < 6.2 no soporta el argumento `deletedIds` (añadido en 7.0). Usar Redis 7+ en Docker.
-- Spaghetti en el pipeline del worker → reutilizar las mismas funciones del análisis de F4/F5; solo cambiar la orquestación.
-- El `StreamMessageListenerContainer` puede consumir mensajes antes de que el grupo exista → configurar `createConsumerGroup` al arrancar.
-
-**Qué NO hacer todavía**
-- Colas de prioridad, dead-letter stream explícita (se añade en F9), RabbitMQ, autoescalado de workers, monitores GUI. Ejecutar código del repositorio analizado.
-
----
-
-### FASE 8 — AI enrichment: onboarding + explicaciones (best-effort) ⭐
-
-**Objetivo**
-Usar la AI como **capa de documentación** sobre los datos deterministas: explicación por módulo, documento de onboarding, y "por dónde empezar a mirar". Con coste controlado y degradación elegante.
+Persistir cada corrida —perfil de carga, resultados, entorno y commit— y poder **repetir** cualquiera de ellas. La comparación deja de ser un número en una consola y pasa a ser un registro reproducible.
 
 **Motivación**
-Regla de oro del proyecto:
-
-```text
-Análisis determinista → descubre hechos
-AI                   → interpreta, resume, explica
-```
-
-La AI **nunca descubre hechos** (no "lee el repo"). Recibe subconjuntos curados: estructura, módulos, edges, deps, framework, entry points, README truncado. Esto controla tokens/coste y mantiene el análisis honesto.
+Un benchmark sin trazabilidad no vale nada: dentro de tres meses nadie sabrá con qué configuración se obtuvo ese número, y las conclusiones del README se quedarán sin respaldo. Esta fase convierte el resultado en un **dato citable**.
 
 **Nuevos conocimientos**
-- **OpenAI Java SDK** (`com.openai:openai-java`) o **RestClient** thin wrapper contra la API de OpenAI. Recomendación para MVP: thin client propio con `RestClient` + Jackson (menos dependencias, aprendes el contrato), dejando el SDK oficial como alternativa si la integración se complica.
-- Diseño de prompts por tarea con **structured outputs** (JSON schema) para explicaciones por módulo y lista "start here"; render en markdown para onboarding.
-- **Selección de contexto**: qué enviar y qué no. README truncado, entry points (main/App/Program), configs, summaries de módulos, top N por LOC/degree. Nunca el repo entero.
-- **Presupuesto de tokens/coste**: cap de llamadas por análisis, cap de tokens por llamada, modelo económico (ej. `gpt-4o-mini`), suma de coste por análisis persistida.
-- **Caching de AI**: mismo `commit` + `modelo` + `versión de esquema` → no re-llamar (enlace con el dedupe de F9).
-- **Degradación**: `aiStatus` = PENDING/RUNNING/COMPLETED/DEGRADED/FAILED. Si la AI falla, el producto sigue con mapa + deps; la UI lo dice. Nunca bloquear el análisis determinista por AI.
-- Retry de la AI con backoff (429/5xx sí; 400 no) reutilizando el clasificador de transitorios.
+- **Modelado de un experimento**: qué se guarda como entidad y qué como JSONB. El perfil y las cifras son documentos que se escriben una vez y se leen enteros; no se consultan por campo.
+- **Repetibilidad**: una corrida se puede relanzar con la misma semilla, el mismo perfil y el mismo dataset, y el sistema **sabe** si las condiciones cambiaron.
+- **Azar controlado**: generación de claves reproducible (misma semilla, mismo patrón zipf).
+- **Histórico y comparación**: agrupar corridas comparables y detectar cuándo dos corridas **no** lo son (modo, entorno o commit distintos).
+- **Progreso en vivo**: cómo publicar el avance de una corrida a los clientes sin que el runner tenga que hablar con nadie.
 
 **Tecnologías**
-- **OpenAI Java SDK** o Spring `RestClient` + Jackson. Base URL configurable por env (permite proveedores OpenAI-compatibles más baratos, hack barato y documentable). **Sin LangChain** (añade abstracción, no valor aquí) y **sin embeddings/RAG**: la selección de contexto es determinista, barata, predecible y cacheable — es una decisión consciente a explicar en entrevista (ver "Por qué NO RAG" abajo).
+JPA + Flyway + JSONB, `@JdbcTypeCode(SqlTypes.JSON)`, `@ConfigurationProperties`.
 
 **Implementación**
-- `ai/` package:
-  - `ContextBuilder` — construcción del contexto curado (budgets).
-  - `PromptTemplates` — templates por tarea.
-  - `OpenAIClient` — RestClient/SDK, retry, structured output, contador de tokens.
-  - `AICacheRepository` — cache por commit en Postgres (tabla `ai_cache` o columna en `analysis`).
-- Etapa `GENERATING_ONBOARDING` en el worker; persistir `aiDocs` JSONB + `aiStatus` + `aiUsage` (tokens + coste estimado).
-- Llamadas (máx. 3–5 según presupuesto):
-  1. Explicaciones por módulo (JSON, batch de módulos en pocas llamadas).
-  2. Documento de onboarding en markdown (resumen arquitectónico, módulos clave, convenciones, cómo correr).
-  3. "Dónde empezar" (3–5 rutas con motivo).
-- `MAX_LLM_CALLS` / `AI_BUDGET_USD` configurables en `application.yml`.
-- Endpoint `GET /api/v1/analyses/{id}/documents` para la UI (onboarding markdown + start here).
+- Entidad `BenchRun` (`id`, `profile` JSONB, `environment` JSONB, `result` JSONB, `mode`, `status`, `createdAt`, `finishedAt`, `commitSha`, `seed`). Serie temporal dentro del JSONB del resultado, salvo que se necesite granularidad por muestra.
+- `GET /v1/runs`, `GET /v1/runs/{id}`, `POST /v1/runs` (crea la corrida y la encola para el runner), `POST /v1/runs/{id}/repeat`.
+- `RunComparator` que **impide** comparar modos distintos y avisa cuando el entorno o el commit difieren.
+- Endpoint de progreso `GET /v1/runs/{id}/stream` (SSE), que en esta fase puede servirse leyendo la fila y en P8 se conecta a la UI.
 
 **Resultado verificable**
-- En repos de prueba: onboarding markdown razonable, explicaciones por módulo, lista "start here" con rutas reales.
-- Doble análisis del mismo commit → segunda vez sin llamadas a la API de AI (cache). Se ve en logs/contador.
-- AI con `API key` inválida o rate-limit: análisis completa y `aiStatus=DEGRADED`/`FAILED`, la UI lo muestra sin romper el mapa.
+- Lanzar una corrida desde `curl` y verla registrada con su perfil, su entorno y sus cifras.
+- `POST /v1/runs/{id}/repeat` la relanza con el mismo perfil y semilla.
+- Intentar comparar una corrida M1 con una M3 devuelve un error claro, no un número.
 
 **Criterios de aceptación**
-- El coste de un análisis queda bajo control (medirlo y mostrarlo; objetivo < ~$0,05 por análisis típico).
-- structured outputs validados con el schema; fallos de parseo → reintento o degradar a `failed`.
-- Documentado en README/ADR: qué decide la AI y qué no.
-- Sin AI key, el sistema entero sigue funcionando (determinista 100%).
+- Toda corrida guarda: perfil, modo, semilla, cifras, entorno (CPU, RAM, versiones, `maxmemory` de Redis, tamaño del pool) y commit.
+- Repetir una corrida con la misma semilla reproduce el perfil exactamente (con test).
+- El esquema está en Flyway, con `ddl-auto: validate`.
 
 **Riesgos**
-- **Rabbit hole de prompt tuning** → límite de tiempo explícito en la fase; "suficientemente bueno" = onboarding correcto y neutral, no perfecto.
-- Enviar contexto enorme (mejores resultados percibidos pero coste disparado) → budgets duros por env.
-- Depender de la AI para el encabezado del mapa → no: el modelo determinista manda.
-
-**Por qué NO RAG/embeddings aquí (decisión documentable):**
-El contexto relevante de un repo (estructura, módulos, deps, entry points) es **estructural**, no semántico. La selección programática + presupuestos hace el trabajo de forma determinista, barata y cacheable. RAG sería complejidad y coste sin ganancia en el MVP. Si algún día se quisiera "descubrir" qué archivos son importantes por similitud, sería una extensión post-MVP, no parte del núcleo.
+- Guardar el resultado en columnas sueltas hasta acabar con una tabla de 40 campos → el perfil y las cifras van en JSONB; solo lo que se filtra (`mode`, `status`, `commitSha`, `seed`) son columnas.
+- Confundir "repetir" con "reproducir exactamente": se repite el **experimento**, las cifras variarán. El sistema no debe prometer lo que no puede cumplir.
 
 **Qué NO hacer todavía**
-- Agentes/gran llamada única, UI chatbot, fine-tuning, multi-modelo, LangChain/LlamaIndex, embeddings/RAG.
+- Automatizar conclusiones (P7) y UI (P8).
 
 ---
 
-### FASE 9 — Robustez: retries, idempotencia, rate limiting
+### FASE P7 — El veredicto
 
 **Objetivo**
-Hacer el sistema asíncrono fiable: reintentos solo para fallos transitorios, sin duplicar trabajo, y protegiendo la API contra abuso. Dead-letter stream para fallos permanentes.
+Convertir las cifras de una corrida en una **conclusión argumentada** y descargable: ganador por eje, evidencia numérica y criterios no medibles, siempre en bloques separados.
 
 **Motivación**
-Aquí es donde aprendes de verdad "background jobs hechos bien". Un sistema así sin esto se rompe en cualquier sistema real en la primera (a) caída de red al clonar, (b) tasa 429 de GitHub/AI, (c) doble clic del usuario o (d) spam. Es el corazón de tu historial de entrevista.
+Es el producto. Una tabla de números obliga al lector a interpretarla; el valor de la herramienta es **decir qué significa** y con qué límites, citando las cifras de *esa* corrida. Y decir también **cuándo no merece la pena Redis**, que es la mitad del objetivo.
 
 **Nuevos conocimientos**
-- **Política de reintentos**: clasificar fallos en transitorios (timeout red, 5xx, 429) vs permanentes (repo no existe, límite de tamaño, tar corrupta). Retry solo transitorios, máximo 2–3, con backoff.
-- **Recuperación con `XAUTOCLAIM`**: reclamar entradas pendientes de la PEL que llevan más de N segundos procesándose (job colgado tras crash) → timeout por job.
-- **Dead-letter stream** `analysis:dead` para fallos permanentes (o intentos agotados): se ack del principal y se registra con motivo. Se podrá re-inspeccionar manualmente.
-- **Idempotencia**: si el mismo `owner/repo` ya tiene un análisis reciente (mismo commit), devolver ese en vez de encolar otro. Control de carrera entre POSTs simultáneos vía verificación en transacción o restricción. Clave: el "dedupe" por commit SHA será la base del cache de AI (F8).
-- **Rate limiting** de la API implementado a mano sobre Redis (sliding window / token bucket): protege `POST /analyses`. Aprender el algoritmo es el objetivo, no instalar un middleware.
-- Timeout y "max time per analysis" configurable; estados consistentes en cada transición.
+- **Reglas de decisión explícitas**: umbrales escritos en código revisable, no en la cabeza de quien mira el gráfico. Se pueden discutir y rebatir.
+- **Separar lo medido de lo no medido**: "Redis fue 3× más rápido" y "pero no tienes Redis en tu stack" son bloques distintos, y el informe lo dice así.
+- **Honestidad estadística**: si la diferencia entre dos implementaciones cae dentro de la dispersión de las repeticiones, la conclusión es **"no se distinguen con esta carga"**, no un ganador elegido por un decimal.
+- **Informe reproducible**: Markdown generado con las cifras y el identificador de la corrida, descargable y pegable en el README.
 
 **Tecnologías**
-- `spring-boot-starter-data-redis` (ya en el stack) → `StringRedisTemplate`/`RedisTemplate` para contadores, `RedisAtomicLong`/`RedisBitCommands` según algoritmo.
-- Retry/backoff: implementación propia o Spring `@Retryable` (spring-retry). Recomendación: implementación explícita corta (clasificador + máximo de intentos + backoff), más didáctica y sin dependencia extra.
-- Logback (ya presente) para logs estructurados en cada transición.
+Java (lógica de reglas, testeable de forma pura), Jackson, plantillas de texto para el Markdown.
 
 **Implementación**
-- `FailureClassifier` (transitorio/permanente) en el paquete `core`.
-- `RetryPolicy` con backoff en clon/descarga y en llamadas AI (preparando integración con F8).
-- Recuperación programada: `@Scheduled` (worker) que ejecuta `XAUTOCLAIM` sobre `analysis:jobs` cada N segundos; timeout de procesamiento por job.
-- Dead-letter: al agotar reintentos o ante fallo permanente, mover a `analysis:dead` con motivo y ack del principal.
-- Dedupe por `(owner, name, commit)` → devolver análisis existente; flag `force` opcional en el body.
-- Middleware/interceptor de rate limit en la API (por IP anónima) sobre Redis: sliding window con INCR+EXPIRE o token bucket atómico (Lua o RedisAtomicLong).
-- Tests específicos: doble submit, kill worker, 429 simulado → retry, abuso → 429 (revisar en F10).
+- `VerdictEngine`: recibe un `RunResult` y devuelve un `Verdict` (record) con ganadores por eje, evidencia y advertencias.
+- Reglas, entre otras: *diferencia por debajo de la dispersión → "no se distinguen"*; *`remaining` incoherente o eviction detectada → advertencia de exactitud*; *contención creciente en Postgres → advertencia de escalado*.
+- Bloque fijo de **criterios no medibles** (sección C.4), que se imprime siempre sin depender de las cifras.
+- `GET /v1/runs/{id}/report` en Markdown, con cifras y el identificador de la corrida.
 
 **Resultado verificable**
-- El mismo repo enviado dos veces seguidas produce **un solo** análisis nuevo reutilizado (o el anterior marcado como "reciente").
-- Matar el worker durante el clon y relanzar el job → reintento limpio o `FAILED` con error claro, nunca estado corrupto. Un job que se cuelga (sin crash) se re-claima tras el timeout (XAUTOCLAIM).
-- Más de N peticiones en la ventana de tiempo → `429 Too Many Requests` con `Retry-After`.
-- Fallos permanentes aparecen en `analysis:dead` con motivo.
+- Sobre una corrida real, el informe dice quién gana en latencia, throughput, exactitud y coste de recursos, y cita las cifras que lo justifican.
+- Con dos implementaciones estadísticamente indistinguibles, el informe dice que **no se distinguen**.
+- Cuando toca, incluye la frase honesta: *"con tu perfil, Redis no se paga"*.
 
 **Criterios de aceptación**
-- Testable de forma determinista: se simulan fallos (mock de HTTP/OpenAI) y se verifica el número exacto de reintentos.
-- Los jobs solo guardan estado final `COMPLETED` o `FAILED`; ningún estado intermedio queda "colgado" tras timeout.
-- El rate limit usa Redis de verdad (probar que funciona sin API).
-- Logs estructurados en cada transición (job id, analysis id, motivo).
+- El motor de reglas se testea **sin infraestructura**: se le pasan `RunResult` construidos a mano y se verifica la conclusión. Debe haber un caso en el que gane la memoria y otro en el que gane Redis.
+- Ninguna conclusión se imprime sin la cifra que la respalda.
+- El informe nombra el identificador de la corrida y el modo de medición.
 
 **Riesgos**
-- Reintentos infinitos → máx. 3 y configurable por env.
-- El dedupe por commit falla si se re-analiza siempre el mismo commit (caso "quiero forzar análisis nuevo") → flag `force` opcional en el body, o ventana temporal (24h) configurable.
-- Implementar el rate limit sobre-ingenierizado (fixed window con Lua desde el inicio) → empezar con sliding window simple sobre INCR + EXPIRE.
-- XAUTOCLAIM y PEL: vigilar que un job no se procese dos veces a la vez (doble consumidor) → marcar `startedAt` en Postgres y comparar con timeout antes de procesar.
+- **Sesgo de confirmación**: escribir reglas que siempre favorezcan a Redis. Se combate con el caso de test obligatorio en el que **gana la memoria**, y con el principio rector 2.
+- Convertir el veredicto en una caja negra → las reglas deben ser legibles y estar documentadas.
+- Prometer generalidad: el veredicto vale para el perfil medido, y el informe lo dice explícitamente.
 
 **Qué NO hacer todavía**
-- Colas de prioridad, RabbitMQ/Kafka, autoescalado de workers, cluster de Redis, monitores GUI tipo dashboard (logs estructurados bastan).
+- Un LLM que "explique" el informe: la conclusión es determinista y sale de reglas. Aquí un modelo solo añadiría imprecisión disfrazada de prosa.
+- UI (P8).
 
 ---
 
-### FASE 10 — Testing y observabilidad
+### FASE P8 — Frontend
 
 **Objetivo**
-Blindar lo construido con pruebas reales y añadir observabilidad (logs estructurados, métricas, health) y CI verde en GitHub Actions.
+Las tres pantallas: claves y cuotas, comparador con progreso en vivo, e informe. Detalle de UX suficiente para que la herramienta se pueda usar sin `curl`.
 
 **Motivación**
-A estas alturas ya hay lógica de parsing, pipeline asíncrono, retries y AI. Sin tests, cualquier cambio posterior rompe cosas en silencio. Y un sistema asíncrono sin trazas es un agujero negro cuando algo falla. Es la diferencia entre "hice un proyecto" y "construí un sistema".
+Ya se domina Next/React, así que esta fase es rápida y puramente de producto. Va al final por una razón estructural: el contrato (rutas, payloads y eventos) ya está **congelado y probado** por los tests de P1-P7, así que la UI es un cliente fino y no hay que reescribirla cuando cambie el backend.
 
 **Nuevos conocimientos**
-- **JUnit 5 + AssertJ + Mockito**: base completa con `spring-boot-starter-test`.
-- **Testing de capas de Spring**:
-  - `@WebMvcTest` (controllers), `@DataJpaTest` (repositorios), `@SpringBootTest` (integración).
-- **Testcontainers**: PostgreSQL y Redis reales en contenedor para tests de integración (`@ServiceConnection` de Spring Boot 4 simplifica la conexión). Prefiere `@DynamicPropertySource` si usas un contenedor custom.
-- Determinismo en jobs asíncronos: Redis real en Docker para tests de integración, fixtures locales de repos, mocks de HTTP/OpenAI (`MockRestServiceServer` de Spring o `@MockBean`/`WireMock`).
-- Flujos de retry: verificar número de reintentos y backoff sin sleeps reales (control de reloj o inyección de scheduler).
-- **Observabilidad**:
-  - `spring-boot-starter-actuator`: `/actuator/health`, `/actuator/metrics`, `/actuator/info`, readiness/liveness.
-  - **Micrometer** para métricas: histograma de latencias API, duración de jobs por etapa, contador de jobs por estado, coste AI acumulado.
-  - **Logback JSON layout** (logstash-logback-encoder) para logs estructurados; incluir `analysisId`, `jobId`, `stage` por evento. Redactar secretos.
-- CI con GitHub Actions: jobs de build Maven (`mvn verify`) y frontend (`npm ci && npm run build && npm run test`).
+- **Next.js App Router** para el flujo del comparador (formulario → corrida en curso → resultado con identificador propio).
+- **SSE en el navegador** con `EventSource`: reconexión automática, eventos nombrados, y el caso crítico de **conectar cuando la corrida ya ha terminado** (el servidor debe enviar el estado actual al abrir; si ya acabó, cierra enseguida).
+- **Visualización de percentiles**: por qué un gráfico de barras del promedio es un engaño y hay que mostrar la distribución (p50/p95/p99 y dispersión).
+- **Estado asíncrono en React**: carreras entre el evento del stream y el `fetch` inicial, y cómo resolverlas.
+- **Degradación y errores**: qué se muestra cuando el stream se cae, cuando el runner no está arrancado, o cuando Redis no responde.
 
 **Tecnologías**
-- Backend: `spring-boot-starter-test` (JUnit 5, AssertJ, Mockito, `MockMvc`), `org.testcontainers:postgresql`, `org.testcontainers:redis`.
-- Obs: `spring-boot-starter-actuator`, micrometer-registry-prometheus (opcional endpoint `/actuator/prometheus`), logstash-logback-encoder.
-- Frontend: `vitest` + `@testing-library/react` (pocos tests: form, stages, mapa render con datos fake).
-- CI: GitHub Actions (jobs: `mvn verify`, `npm run build` + tests, typecheck).
+Next.js 16 (App Router, TypeScript, Tailwind 4), `EventSource`, `@tanstack/react-query` para el estado del servidor.
 
 **Implementación**
-- `src/test/java/...` en backend: unit (parsers, agregación, rate limit, clasificador de errores), servicios (con mocks), integración (pipeline completo contra Postgres+Redis Testcontainers, repo fake local), API (`MockMvc`).
-- Mocks: `MockRestServiceServer` para codeload/GitHub; OpenAI → stub de HTTP o `@MockBean`.
-- `apps/web` tests: 2-3 componentes clave.
-- Workflow CI con matrix de JDK 21 y Node.
-- Actuator expuesto (health, info, metrics); endpoint `/actuator/prometheus` opcional.
-- Logback JSON: layout estructurado en `application.yml` o `logback-spring.xml`.
-- Tests de regresión: cada bug corregido en F4-F9 debe recibir un test.
+- `/` — estado del sistema: ¿está la API viva?, ¿están Postgres y Redis?, ¿cuál es la implementación activa?
+- `/keys` — crear, listar y revocar claves y escenarios; muestra el `429` en directo al pasarse de cuota.
+- `/compare` — describir el perfil, lanzar la corrida, seguirla en vivo y ver el resultado.
+- `/runs` — histórico, con filtro por modo y aviso de "no comparable" cuando el modo o el entorno difieren.
+- `/runs/[id]` — informe con el veredicto y botón de descarga.
+- **Regla no negociable: la UI no mide.** No cuenta peticiones ni cronometra nada. Solo muestra lo que el servidor ya midió (principio rector 3).
+- `.env.local` con la URL de la API, y **petición directa a la API** (`:8000`) en lugar de *proxear* el SSE por un rewrite de Next: el buffering del proxy rompe los streams.
 
 **Resultado verificable**
-- `mvn verify` (backend) y `npm run test` (web) verdes en local y en CI tras push.
-- Un test de integración lanza el pipeline completo contra servicios reales (Testcontainers) y verifica éxito/fallo determinista.
-- `/actuator/health` responde `UP`; logs con campos estructurados (`analysisId`, `stage`); `/actuator/metrics` muestra contadores.
+- Desde la UI, crear una clave, ver cómo se agota su cupo y cómo responde `429` con las cabeceras.
+- Lanzar una corrida con las tres implementaciones, ver el progreso en vivo y el resultado comparado.
+- Refrescar la página a mitad de una corrida: la UI se reconecta y muestra el estado correcto.
+- Abrir el informe de una corrida antigua y descargarlo en Markdown.
 
 **Criterios de aceptación**
-- Cobertura razonable de los paths críticos (parsers, pipeline, retries, rate limit, dedupe) — no 100%, sino los que evitan regresiones.
-- CI ejecuta build + tests en cada push.
-- Los tests no dependen de red externa (todo mockeado) salvo los de integración explícitamente marcados.
-- Documentado en README cómo correr tests y cómo leer los logs/métricas.
+- **Ningún componente de la UI realiza mediciones**: se verifica revisando que no hay contadores ni temporizadores en el cliente.
+- La página de una corrida inexistente muestra 404 con salida clara.
+- El comparador muestra la dispersión, no solo un número por eje.
+- Tests de los componentes clave con Vitest + Testing Library: formulario de perfil, mapeo de estados, montaje del gráfico con datos fijos y el caso "sin datos".
+- Aviso en el README: Vitest **no** soporta *Server Components* asíncronos; se testean componentes de cliente con lógica y el resto se cubre con el smoke de P10.
 
 **Riesgos**
-- Tests flaky (timeouts, puertos en uso, contenedores lentos) → helpers deterministas (esperar readiness, puertos efímeros, fixture de "reset db").
-- Sobredimensionar observabilidad (backends, dashboards) → Actuator + logs JSON + métricas clave bastan para el MVP; un backend OTLP/dashboard self-hosted es opción post-MVP.
-- Mocks que "mienten" vs la realidad → tests de integración reales (Testcontainers) para el pipeline, mocks solo para HTTP externo (GitHub/OpenAI).
+- **Sobrediseñar la UI.** Es una herramienta: claridad y densidad de datos por encima de estética.
+- **Medir en el cliente** por comodidad (contar en el navegador es más fácil que instrumentar el servidor) → prohibido; es el error que invalidaría todo el laboratorio.
+- Gráficos que sugieran conclusiones que los datos no sostienen (barras de promedios, ejes truncados).
 
 **Qué NO hacer todavía**
-- E2E Playwright completo, coverage 100%, dashboards complejos, centralizado de logs, alerting.
+- Escritorio, temas oscuros elaborados, colaboración, autenticación de usuarios, deployment público.
 
 ---
 
-### FASE 11 — Docker: entorno local reproducible
+### FASE P9 — Redis por dentro (resumen)
 
-**Objetivo**
-Empaquetar todo en imágenes reproducibles y conseguir que `docker compose up --build` levante **todo** el sistema en local: web, api, worker, redis y postgres con un solo comando.
+Instrumentar el interior de Redis durante las corridas: `INFO` (memoria, keyspace, `evicted_keys`), `SLOWLOG`, `MEMORY USAGE`, fragmentación, eviction y picos por `BGSAVE`/AOF.
 
-**Motivación**
-Ya se usó Docker como medio de desarrollo (F7+). Ahora se hace bien: imágenes optimizadas, multi-stage, usuario no root, healthchecks, `.dockerignore`. Este compose **ES el entregable de ejecución del proyecto**: el destino final no es servirlo para otros, es que cualquiera pueda arrancar RepoVisor completo con un comando. Es la diferencia entre "funciona en mi máquina" y "funciona en cualquier máquina con Docker".
+- **Verificable**: forzar `BGREWRITEAOF` y **ver el pico en el p99**; bajar `maxmemory` hasta que haya eviction y ver la **exactitud deteriorarse**; con pipelining sube el throughput.
+- **Riesgo principal**: instrumentar dentro del camino caliente invalida la medición. La captura va fuera del runner.
 
-**Nuevos conocimientos**
-- **Multi-stage build Maven**: etapa build con `maven:3.9-eclipse-temurin-21` → `mvn package`; etapa runtime con `eclipse-temurin:21-jre` (mucho más pequeña) y usuario no root. Copiar solo el JAR final.
-- Frontend **Next.js `output: 'standalone'`**: build de Node con `npx next build`, copiar `next.config` standalone a una imagen node slim.
-- Optimización de capas y cache de BuildKit, `.dockerignore`, tamaño de imagen.
-- Compose completo: perfiles dev vs "full", env vars desde `.env`, volumen para postgres/redis, orden de arranque y dependencias entre servicios (wait-for health), `restart: unless-stopped`.
-- Healthchecks: ejecutables dentro del contenedor (wget/curl para API, `pg_isready` para Postgres, `redis-cli ping` para Redis), `CMD-SHELL`.
+### FASE P10 — Docker, smoke y demo (resumen)
 
-**Tecnologías**
-- Docker + Compose v2 (BuildKit).
-- Imágenes: `maven:3.9-eclipse-temurin-21` (build), `eclipse-temurin:21-jre` (runtime backend), `node:24-alpine` (runtime web), `postgres`, `redis:7`.
+Cinco servicios con un solo comando: `docker compose up --build`.
 
-**Implementación**
-- `Dockerfile.backend` (multi-stage, un solo JAR = dos entrypoints por profile) y `Dockerfile.web` (Next standalone).
-- `compose.yml` con los **5 servicios**: web, api, worker, redis, postgres + volúmenes + healthchecks.
-- Perfiles o variable `TARGET=dev|full` para alternar el modo "código montado con reload" vs "imágenes construidas".
-- Etiquetado por commit git (`BUILD_SHA`) para trazabilidad.
-- `.dockerignore` en backend y web.
-
-**Resultado verificable**
-- En una terminal: `docker compose up --build` → healthchecks verdes → `http://localhost:3000` funciona de punta a punta (form → análisis → mapa → onboarding).
-- La API responde en `http://localhost:8000`; los logs del worker son visibles con `docker compose logs -f worker`.
-- Builds reproducibles (la misma imagen sale igual en dos máquinas).
-
-**Criterios de aceptación**
-- Imágenes sin secretos incrustados (todo por env), sin usuario root en runtime.
-- Healthchecks marcan ready/healthy en los 5 servicios.
-- El worker arranca automáticamente y procesa jobs tras un reinicio del contenedor.
-- Tamaños razonables (guías: imagen JRE backend < ~400MB, Next standalone < ~200MB; comprobar).
-- Se puede resetear el estado por completo con `docker compose down -v` y volver a arrancar sin pasos extra.
-
-**Riesgos**
-- Problemas de build tree-sitter en la imagen slim → fijar la dependencia como JAR (los nativos de bonede vienen incluidos) o pasar a imagen con build-deps solo en la etapa de build.
-- Enredarse con multi-stage → es simple aquí: una etapa Maven (build) y una runtime; Next un solo stage standalone.
-- Uso de imágenes enormes por descuido → revisar `docker image ls` y `.dockerignore`.
-
-**Qué NO hacer todavía** (esto ya es definitivo, no "de momento")
-- Kubernetes, registro de imágenes remoto, builds remotas, orquestadores, Helm. Nada orientado a servir tráfico externo.
+- `api` y `runner` salen de **la misma imagen** con distinto `command`; Next *standalone*; healthchecks con `depends_on: service_healthy`; `scripts/smoke.ps1`; CI; demo grabada; README de portfolio.
+- **Verificable**: cinco servicios `healthy`; smoke verde dos veces seguidas; `down -v` y arrancar limpio sin pasos manuales.
+- **Riesgo principal**: que la demo corra en Docker y las conclusiones se midieran en nativo → se declara, porque cambia la latencia.
 
 ---
 
-### FASE 12 — Reproducibilidad: bootstrap limpio, transport local y smoke
+## Plan de tests
 
-**Objetivo**
-Garantizar que RepoVisor se pueda arrancar en **cualquier máquina con Docker en menos de 5 minutos**: clonar, leer el README, un comando, y el sistema entero funcionando. Incluye un flujo de smoke verificado y determinista, y un transporte **local** para análisis sin red ni servicios externos.
-
-**Motivación**
-El entregable final del proyecto es **local**. El equivalente a "desplegar" es aquí **reproducir sin fricción**: si un evaluador o tu futuro yo no pueden arrancar el proyecto en una máquina limpia con un comando, el portfolio falla en el primer contacto. Además, el demo grabado (F13) se apoya en este arranque: si no es reproducible, no es grabable varias veces.
-
-**Nuevos conocimientos**
-- Bootstrap limpio: `docker compose up --build` determinista, espera de healthchecks, orden de arranque.
-- Gestión de configuración por env: `.env.example`, variables obligatorias vs opcionales validadas en `application.yml` (`OPENAI_API_KEY`, `GITHUB_TOKEN`, límites/budgets), y `.env` local nunca versionado.
-- **Transporte "local" para el analizador**: además del clon vía GitHub tarball, el pipeline acepta una **carpeta local** (o un ZIP subido por la UI) como fuente de análisis. Extensión pequeña de F4/F7 con enorme valor de determinismo: tests, smoke y demo offline sin GitHub ni AI.
-- Script de smoke E2E local: arranca compose, espera servicios, lanza un análisis (modo local, sin AI o con AI según env), verifica el estado final y los artefactos.
-- Documentación de operación: qué hace cada servicio, puertos, cómo ver logs, cómo resetear datos, solución de problemas comunes.
-
-**Tecnologías**
-- Docker Compose (ya presente), PowerShell (`scripts/smoke.ps1`) y, si es trivial, un `smoke.sh` equivalente. **No se añaden tecnologías nuevas**: esto es scripting y configuración sobre lo ya construido.
-
-**Implementación**
-- `apps/backend/.env.example` + validación de propiedades requeridas en `application.yml` (obligatorias: `SPRING_DATASOURCE_URL`, `SPRING_DATA_REDIS_URL`; opcionales: `OPENAI_API_KEY`, `GITHUB_TOKEN`, límites/budgets).
-- Extensión del transporte (F4) con modo `local: /ruta/carpeta` (o endpoint de upload ZIP) para análisis sin red.
-- `scripts/smoke.ps1`:
-  1. `docker compose up --build` y esperar healthchecks (timeout configurable);
-  2. lanza un análisis sobre un repo fixture local (offline, sin AI) y verifica `COMPLETED` + artefactos;
-  3. si `OPENAI_API_KEY` presente, lanza un análisis real de un repo GitHub pequeño y verifica `aiStatus=completed` o `degraded`;
-  4. imprime un resumen claro (PASS/FAIL por paso).
-- README de operación: tabla de servicios, puertos, comandos, reset (`docker compose down -v`), y troubleshooting.
-- (Opcional) Job de CI que construye las imágenes y ejecuta el paso offline del smoke para probar la reproducibilidad en máquina limpia.
-
-**Resultado verificable**
-- En una máquina limpia: `git clone …` → `cp .env.example .env` (o ni eso, si los defaults bastan) → `docker compose up --build` → web en `:3000`, api en `:8000`.
-- `scripts/smoke.ps1` pasa de punta a punta sin red (transporte local) y con una validación real de AI si hay key.
-
-**Criterios de aceptación**
-- El arranque no exige pasos manuales más allá de copiar `.env.example` y un comando.
-- El smoke offline pasa de forma determinista dos veces seguidas (sin red ni timeouts raros).
-- Se puede reproducir el flujo completo con un repo real de GitHub (con Internet) siguiendo solo el README.
-- El README documenta por qué el proyecto es local y qué aporta cada componente — es la pieza de portfolio que leerá primero un evaluador.
-
-**Riesgos**
-- Enredarse con scripts multi-plataforma → mantener PowerShell como primario y `smoke.sh` solo si es trivial; los comandos del README deben ser copiar-pegar reales y validados.
-- Confundir "reproducibilidad" con "automatización excesiva" → objetivo explícito: un comando y < 5 minutos; el resto es limpieza, no herramienta.
-- El transporte local crea una vía "no real" en el pipeline → mantenerla claramente separada del transporte GitHub (nunca mezclar código), y cubierta por tests en F10.
-
-**Qué NO hacer todavía**
-- Deployment público, PaaS, dominio/HTTPS, registros remotos, backups externos. Nada cuyo único objetivo sea servir a otros usuarios.
-
----
-
-### FASE 13 — Pulido, demo grabada y versión portfolio
-
-**Objetivo**
-Convertir el MVP en algo presentable y demostrable: UX final, README fuerte con decisiones, y una **demo grabada en vídeo** del flujo completo de producto.
-
-**Motivación**
-El portfolio no es solo el código: es cómo se ve, cómo se explica, cómo se demuestra y qué historia cuenta. Sin deployment, la "exhibición" del proyecto es (1) el repo con un README impecable y reproducible, y (2) un vídeo de demo que recorre el producto de punta a punta. Esta fase es barata comparada con el valor que da a entrevistas.
-
-**Nuevos conocimientos**
-- Poca tecnología nueva; mucho criterio: estados vacíos/error/loading, escala de nodos, leyenda, "start here" integrado en el mapa, onboarding en pestaña, listado de análisis previos re-abrible.
-- SEO/OG local (metadatos + favicon/título) — irrelevante para ranking, útil para presentabilidad del README/capturas.
-- **Guion de demo**: cómo estructurar un vídeo corto (2–3 min) que enseñe progreso asíncrono, mapa y onboarding sin florecer.
-- Presentación del proyecto: README con arquitectura, decisiones (ADR compilados), "cómo correr localmente", capturas/GIF, vídeo de demo corto, y una sección de "trade-offs y siguiente pasos" — esto es lo que se lee en 30s de entrevista.
-
-**Implementación**
-- (Opcional y recomendado si aporta) **SSE** para progreso en vivo sustituyendo al polling, o mantener polling si el SSE no aporta. Decisión: si ya está todo, implementar SSE es un extra de producto pequeño (ya lo dominas) que mejora la percepción del vídeo de demo. Solo si no retrasa.
-- Página de análisis por UUID (sin auth; suficiente para el MVP y para el vídeo).
-- Pulido del mapa (colores, sizes, leyenda, tooltips) y de la página del onboarding (markdown bonito).
-- **Demo grabada**: vídeo corto (2–3 min) siguiendo el flujo:
-
-  ```text
-  GitHub URL → Job creado → Redis Stream → Worker → Análisis determinista → AI enrichment
-    → Resultado → Mapa interactivo → Onboarding
-  ```
-
-  Con un repo de ejemplo escogido (pequeño, con varios módulos, en un lenguaje que domines). Opción B (fallback sin Internet): demo del mismo flujo usando el **transporte local** de F12.
-- README final + capturas/GIF + enlace al vídeo.
-- Checklist de "qué decir en entrevista" (juicios de diseño hechos aquí).
-
-**Resultado verificable**
-- Una persona ajena clona el repo, sigue el README, arranca con **un comando** y analiza un repo entendiendo el resultado sin asistencia.
-- Existe un vídeo de demo reproducible que recorre el flujo completo del producto.
-- README cuenta la arquitectura, decisiones y trade-offs en < 5 min de lectura.
-
-**Criterios de aceptación**
-- La demo es un vídeo con guion y repo de ejemplo fijos; puede recrearse en cualquier momento, no depende de un servicio externo que pueda estar caído.
-- Los estados de error del producto completo son legibles ("repo demasiado grande", "AI no disponible").
-- Limpieza: sin dead code, sin dependencias sin uso, logs estructurados como se documentó.
-- (Opcional) SSE live funcionando en el stack local.
-
-**Riesgos**
-- **Polish forever** → tope de tiempo en la fase; "suficientemente bueno" revisado contra la checklist.
-- Añadir features de golpe (auth, share links con usuario, etc.) → se listan en "Versión portfolio" (E/F) y se posponen.
-
-**Qué NO hacer todavía**
-- Auth real/completa, multi-tenant, pagos, billing, feature flags, i18n, app mobile.
-
----
-
-# C. Dependencias entre fases
-
-```text
-F1 ──► F3 ──► F4 ──► F5 ──► F6 ──► F13
- │                                   ▲
- ├─► F2 ─────────────────────────────┘  (frontend consume API desde F3)
- │
- └─► F7 (necesita F4+F5 async) ──► F8 (necesita F5+F6+F7)
- F7 ──► F9 (robustez sobre el pipeline asíncrono)
- F8 ──► F9 (retries de AI)
- F9 ──► F10 (tests de robustez)        F3 ──► F10 (tests API)
- F10 ──► F11 ──► F12 ──► F13
- F6 ──► F10 (tests web)
-```
-
-Explicación de las principales:
-- **F2 es frontend con datos mock**: depende solo de F1 (Spring Boot hello). Se adapta a la API real en F3.
-- **F3 depende de F1**: necesita JDK/Maven/Spring Boot configurado y Postgres.
-- **F4 y F5 dependen de F3**: extienden el `AnalysisService` y las columnas JSONB existentes.
-- **F6 depende de F5**: el mapa necesita el grafo producido por el análisis completo.
-- **F7 depende de F4+F5** (pipeline de análisis) y de F3 (persistencia). Extrae el pipeline a un worker asíncrono. **Recomendado completarlo antes de F8** (la AI corre dentro del worker).
-- **F8 depende de F6 y F7** (contexto determinista desde F4-F5 + ejecución asíncrona).
-- **F9 depende de F7** (infra de colas) y **antes de F9** se recomienda tener F8 (los retry/backoff de la AI lo usan). Se puede solapar con F6/F7 sin problema.
-- **F10** testea todo lo anterior; por eso va tras F9. Puedes ir escribiendo tests por fase desde F4 (recomendado), pero la fase 10 los consolida y añade CI.
-- **F11 y F12** requieren el código estable de F3-F10.
-
----
-
-# D. Timeline (baseline 6 semanas + variante exprés)
-
-Ritmo asumido: trabajo a tiempo parcial pero constante (≈ 3–4 h/día o fines de semana completos). Las fases con ⭐ son las más pesadas. Se incluyen colchones.
-
-| Semana | Fases | Énfasis |
+| Nivel | Herramienta | Qué cubre |
 |---|---|---|
-| 1 | F1, F2, F3 | Base: JDK/Maven/Spring Boot, frontend mínimo, JPA + Flyway |
-| 2 | F4, F5 | Análisis determinista (JavaParser + tree-sitter + deps) |
-| 3 | F6 ⭐, F7 ⭐ | Mapa React Flow + pipeline asíncrono Redis Streams |
-| 4 | F8, F9 | AI enrichment con presupuestos y degradación + robustez (retries, idempotencia, rate limit) |
-| 5 | F10, F11 | Testing/obs (Testcontainers, Actuator) + Docker reproducción |
-| 6 | F12, F13 | Reproducibilidad + smoke + demo y pulido |
+| Unitario | JUnit 5 + AssertJ, sin Spring | reglas del veredicto, percentiles, perfil de carga, validación, hashing de claves |
+| Concurrencia | `ExecutorService` + `CountDownLatch` | 100 hilos contra límite 10 → **exactamente 10 permitidas** (×3 implementaciones) |
+| Exactitud | mismo contrato abstracto ×3 subclases | cada algoritmo permite lo que dice su modelo |
+| Web (slice) | `@WebMvcTest` + MockMvc + **`@MockitoBean`** | rutas, validación, errores, cabeceras, `429` |
+| Persistencia (slice) | `@DataJpaTest` + Testcontainers Postgres | mapeos, JSONB, Flyway desde esquema vacío |
+| Integración | Testcontainers Postgres + Redis | adaptadores reales, `fail-open`/`closed`, eviction, TTL |
+| Sistema | `@SpringBootTest(RANDOM_PORT)` | `POST` → SSE → resultado → informe |
+| Frontend | Vitest + Testing Library | formulario, mapeo de estados, gráficos con datos fijos |
+| Smoke | `scripts/smoke.ps1` | arranque completo con un comando |
 
-- **Semanas 1 y 2** tienen margen para asimilar Java/Spring Boot (zonas nuevas).
-- **Semanas 3 y 4** son el corazón del producto: no recortar F7 ni F8.
-- **Semana 6** es la más agresiva (2 fases). Si se tarda más en semanas 1–5, la semana 6 solo pierde pulido, no producto.
+**Reglas:** `mvn clean verify` siempre (nunca `mvn compile`); los tests de integración llevan `@Tag("integration")` y quedan excluidos por defecto; ninguna medición real depende de la red; `@MockitoBean` y **no** `@MockBean` (eliminado en Spring 7 / Boot 4).
 
-### Variante exprés (4 semanas)
-Prioridad dura: F1→F3→F4→F5→F6→F7→F8→F11→F12. Se eliminan/recortan:
-- **F9** reducido a lo mínimo (idempotencia simple) — se retoman retries/rate limit después o se documentan como "next steps".
-- **F2** se fusiona con F3 (hacer el frontend mínimo directamente contra la API real).
-- **F10** solo tests críticos de regresión, sin observabilidad ni CI full.
-- **F13** reducido a README + demo básica grabada.
-- Riesgo: la robustez y la observabilidad son exactamente el material de entrevista. La variante exprés es solo si el plazo es innegociable.
+## ADRs (`docs/decisions`)
 
-### Señal de "estoy en plazo"
-Al final de cada semana debe existir una demo incremental (un repo de prueba analizado de punta a punta hasta donde la fase llegue). Si una semana se atasca > 2 días en una fase, recortar el alcance de esa fase antes de arrastrar el retraso (ver riesgos de cada fase).
+- `0001` Un solo proyecto con dos perfiles: `api` y `runner`.
+- `0002` Tres implementaciones detrás de una interfaz `RateLimiter` (y por qué aquí sí se justifica).
+- `0003` Redis es efímero y prescindible; los resultados viven en Postgres.
+- `0004` Rigor del banco de pruebas: warmup, percentiles, modos M1/M2/M3, *coordinated omission*, entorno declarado.
+- `0005` La UI no mide: la medición vive en el servidor.
+- `0006` Herramienta, no producto: sin precios, sin clientes, sin deployment público.
 
----
+## Apéndice — lo que se evaluó y se descartó
 
-# E. MVP — qué entra y qué NO entra
+**Redis como cola de trabajos (Streams, consumer groups, PEL, `XAUTOCLAIM`).** Se evaluó repartir trabajo entre procesos y se descartó: este laboratorio no reparte trabajo, aplica límites. El reparto atómico (`XREADGROUP`), la lista de pendientes (PEL) y la recuperación de un worker caído (`XAUTOCLAIM`) solo tienen sentido con workers persistentes, y aquí no los hay. Si algún día se añade una cola, ese diseño merece su propio ADR.
 
-## Entra en el MVP
-1. Analizar repositorios **públicos** de GitHub, limitados en tamaño y nº de archivos.
-2. Lenguajes: **Java, TypeScript, JavaScript**. Fuera de estos → rechazo claro o análisis de estructura únicamente (decisión: rechazo con mensaje).
-3. Pipeline asíncrono visible por etapas: `queued → cloning → scanning → analyzing_deps → building_architecture → generating_onboarding → completed | failed`, con polling desde la UI.
-4. Análisis determinista:
-   - clonado por tarball + escaneo + stats (LOC, conteos);
-   - metadatos GitHub (descripción, lenguaje, default branch, commit SHA, stars);
-   - dependencias de manifests y detección de framework;
-   - grafo de **módulos** (paquetes Java o directorios top-level TS/JS) con edges y frecuencias.
-5. Mapa interactivo en **React Flow**: nodos por módulo, capas con color, click para detalles (path, LOC, deps in/out).
-6. **AI (best-effort)**: explicaciones por módulo + documento de onboarding markdown + "dónde empezar". Cacheado por commit, presupuestado por tokens/coste, **degradable**: falla la AI → el mapa y deps siguen visibles.
-7. Persistencia de análisis y **re-apertura** de cualquiera pasada (listado).
-8. Robustez básica: reintentos de transitorios (2–3 con XAUTOCLAIM), idempotencia por commit, rate limiting en la API, timeouts, dead-letter stream, estados consistentes.
-9. Docker Compose: **stack completo reproducible en local** (web, api, worker, redis, postgres) con un solo comando.
-10. Transporte **local** de repos (sin red) para tests y demo.
-11. Tests de regresión del núcleo + CI (Maven + Node).
+**Redis como caché de resultados.** Igual de innecesario: los resultados se escriben una vez y se leen enteros, y Redis puede desalojarlos o vaciarse.
 
-## Fuera del MVP
-- **Auth/cuentas de usuario** (páginas por UUID sin auth bastan para el uso local y la demo).
-- Otros lenguajes (Go, Rust, Ruby…) — solo si sobra tiempo.
-- Resolución de imports "a lo perfecto" (workspaces, aliases, bundlers, LSP, symlinks).
-- Grafo a nivel de **archivo** (el mapa es por módulo). Drill-down de archivos es post-MVP.
-- Ejecutar los tests del repo analizado / CI analysis.
-- Métricas de comunidad/historia del repo (bus factor, PRs, commits).
-- Chatbot/assistant AI, RAG, embeddings, LangChain.
-- SSE (post-MVP si aporta), offline/PWA, i18n.
-- Monitores GUI, dashboards de observabilidad completos.
+## Qué NO es este proyecto
 
----
+- No es un servicio que se venda, ni un producto con clientes y precios.
+- No es un benchmark de librerías: **`redis-benchmark` no se usa**. Se mide **nuestro** limitador.
+- No es una comparación general Redis contra Postgres: es **una decisión concreta** (limitar peticiones) medida bajo perfiles concretos.
+- No hay deployment público, ni cluster, ni multi-nodo.
 
-# F. Versión portfolio (post-MVP, elegir 2–3 máx.)
+## Riesgos globales
 
-El MVP ya es un portfolio creíble. Estas extensiones lo fortalecen; **elegir 2–3 para no morir de éxito**. Ordenadas por ratio valor/esfuerzo y alineación con tu posicionamiento:
-
-1. **Panel de "coste y uso de AI por análisis"** — tokens por llamada, coste estimado, cache hits. Historia perfecta de "Product + AI con juicio de coste". Datos ya existentes de `ai_usage`; solo se exponen en la UI.
-2. **Drill-down file-level dentro de un módulo** — expandir nodo y ver archivos e imports entre ellos. Usa datos que ya genera el pipeline (file↔module existente); añade un grafo secundario. Muy barato visualmente, gran impacto de producto.
-3. **SSE en vivo** para sustituir el polling. Pequeño, dominio ya dominado, mejora percepción de "tiempo real".
-4. **Soporte de monorepos/workspaces** (package.json workspaces, pnpm/nx, más de un proyecto por repo) — añade realismo a repos grandes; toca F5 (la parte más peligrosa). Hacerlo solo con tiempo y si se documenta bien el alcance.
-5. **Extensibilidad demostrada**: añadir un 5º lenguaje vía nueva extensión de tree-sitter (Go o Rust) para enseñar que el pipeline es extensible. Un ADR + una gramática + tests.
-6. **OAuth GitHub para repos privados** — introduce auth real (permisos, tokens) y permite analizar repos de tu propia cuenta. Más coste: auth + gestión de tokens.
-7. **Observabilidad "real"**: conectar Actuator/Micrometer a un backend de trazas y dashboards **self-hosted** (p. ej. Grafana + Prometheus + OTel collector en local). Refuerza la narrativa de systems engineer sin necesidad de servicios externos.
-
-**Recomendación para tu perfil**: (1) panel de coste AI + (2) drill-down + (3) SSE. Esa terna demuestra producto full-stack, AI con criterio económico y UX refinada — exactamente las tres cosas que quieres vender (Software/Full-Stack/Product/AI). Dejar (4) y (6) como "próximos pasos" en el README.
-
----
-
-# G. Stack final (y por qué)
-
-| Tecnología | Rol | Por qué (y por qué no otra) |
-|---|---|---|
-| **Next.js + React + Tailwind** | Frontend | Ya lo dominas; da producto real rápido sin inventar. App Router + client para React Flow. |
-| **@xyflow/react (React Flow v12)** | Mapa | Única librería de grafos con una necesidad real (mapa interactivo de arquitectura). Activa y con SSR-safe. |
-| **Java 21 LTS** | Lenguaje backend | LTS, moderno (records, sealed, pattern matching), base del ecosistema enterprise. El gap de aprendizaje principal. |
-| **Spring Boot 4.1.x** | Framework | OSS actual (2026); DI, autoconfiguración, REST, JPA, Actuator, profiles en un solo ecosistema. **3.5.x quedó EOL en junio 2026.** |
-| **Maven** | Build | Estándar Java; `pom.xml` simple y didáctico. Gradle es alternativa válida pero más compleja para un primer proyecto. |
-| **Spring Data JPA + Flyway** | ORM/migraciones | JPA es EL ORM Java; Flyway es más simple que Liquibase. |
-| **`@JdbcTypeCode(SqlTypes.JSON)`** | JSONB | Artefactos del análisis como JSONB en columnas; sin sobre-modelar tablas. |
-| **PostgreSQL** | Persistencia | Ya lo conoces; aquí como fuente de verdad de un sistema multi-servicio. |
-| **Redis** | Stream + rate limit | Entra por necesidad (F7: colas; F9: rate limit). No hay otra razón en el MVP. |
-| **Redis Streams** | Cola de jobs | Soporte nativo en Spring Data Redis (`StreamMessageListenerContainer`, consumer groups, XAUTOCLAIM). Sustituye a RQ/Celery sin infraestructura extra. |
-| **JavaParser** | Parsing Java | AST + symbol solver; extracción de paquetes, clases e imports de forma robusta. |
-| **tree-sitter (bonede JVM)** | Parsing TS/JS | CST robusto donde regex falla; bindings JVM mantenidos (`io.github.bonede:tree-sitter` 0.26.x). |
-| **RestClient** | HTTP | El HTTP client moderno de Spring para codeload y GitHub API. |
-| **OpenAI Java SDK / RestClient** | AI enrichment | Llamadas de interpretación con structured outputs, presupuestadas y cacheables. Sin abstracciones extra. |
-| **spring-boot-starter-actuator + Micrometer + Logback JSON** | Observabilidad | Health, métricas y logs estructurados desde F10. Sin backends caros en MVP. |
-| **JUnit 5 + AssertJ + Mockito + Testcontainers** | Tests | Backend Java estándar; Postgres/Redis reales en contenedor para integración. |
-| **vitest + @testing-library/react** | Tests frontend | Mínimo frontend. |
-| **Docker + compose** | Entorno reproducible | Necesario desde F7 por Windows; levanta el stack completo (web, api, worker, redis, postgres) con un comando, en local. |
-| **GitHub Actions** | CI | Build + tests por push (JDK 21 + Node). |
-
-**Stack deliberadamente 100 % local**: se ejecuta entero en Docker Compose, sin ningún servicio desplegado para terceros. Docker, Redis, Postgres, el worker y Java son parte del aprendizaje y del diseño; no son preparación para una infraestructura de producción ajena.
-
-**Descartadas a propósito** (para poder explicarlo en entrevista): RQ/Celery/*anything Python*, RabbitMQ/Kafka, Kubernetes, LangChain, embeddings/RAG, AWS y cualquier PaaS público. Cada una tiene un "por qué no" escrito arriba o en las fases.
-
----
-
-# H. Riesgos principales (qué convierte 4–6 semanas en 2–3 meses)
-
-Ordenados por probabilidad × impacto:
-
-1. **Querer resolver imports "perfectamente"** (aliases @, workspaces, monorepos, barril imports, symlinks). Es la trampa #1 de un analizador de código. **Mitigación**: protocolo de resolución fijado en F5 con `unresolved` como métrica; cap de archivos/nodos; rechazar la tentación iterativa.
-2. **Rabbit hole de prompt/AI** (buscar el onboarding perfecto, añadir agentes, multi-modelo, RAG). **Mitigación**: presupuesto duro de tokens/llamadas, "suficientemente bueno" definido en F8, y el determinismo como capa infalible. La AI es complementaria, nunca protagonista.
-3. **Scope de "mejores feature"** (auth, chat, file-level, monorepos, métricas de comunidad) introduciéndose en el MVP. **Mitigación**: secciones E y F explícitas + checklist de cada fase de "qué NO hacer todavía".
-4. **Windows friction** (Redis no nativo, paths, JAVA_HOME, tree-sitter DLLs, PowerShell vs bash). **Mitigación**: desde F7 el worker/Redis corren en Docker Linux; verificar `java -version`/`mvn -version` en F1; documentar comandos PowerShell. Nunca instalar Redis nativo.
-5. **Spring Boot 4.x vs tutoriales de 3.x** (namespace `jakarta`, APIs cambiadas). **Mitigación**: usar como referencia las guías oficiales de Spring Boot 4 y documentación de Spring Framework 7; ante dudas, validar con `mvn dependency:tree` y docs oficiales. Si el bloqueo es grave, bajar a 3.5.x es aceptable (EOL).
-6. **Tests asíncronos flaky** que consumen horas de depuración. **Mitigación**: Testcontainers estables, repos fixtures locales (sin red), mocks de HTTP/AI, marcar claramente los tests de integración.
-7. **Over-engineering del monorepo/tooling** (paquetes compartidos, workspaces npm, build AOT, pipelines CI exóticos) antes de tener product. **Mitigación**: solo apps/web y apps/backend; el CI real llega en F10.
-8. **Coste de la AI en desarrollo y demo** (cada análisis "real" de un repo paga tokens). **Mitigación**: modelo barato, cache por commit, `AI_BUDGET_USD`, y transporte local sin AI (F12) para tener tests y demo offline con coste cero.
-9. **Sobrediseñar la arquitectura de datos** (normalizar tablas de artefactos, colas de prioridad, microservicios). **Mitigación**: decisión F1 de JSONB + "hazlo simple, normaliza cuando duela".
-10. **Perfección del mapa/UX prematura** (layout custom, animaciones) en F6. **Mitigación**: dagre + cap de nodos; diseño se pulsa en F13.
-11. **Perder el norte del objetivo de aprendizaje** (montar microservicios o infra para "parecer avanzado"). **Mitigación**: regla de __necesidad real__ aplicada fase a fase en "Motivación".
-
----
-
-# Apéndice: conceptos que debes conocer al terminar
-
-Para cada bloque, poder explicar con tus palabras (y un ejemplo del proyecto):
-
-- **Async pipeline**: Redis Streams, consumer groups, PEL, XAUTOCLAIM, job lifecycle, ack/fail, timeout, retry/backoff, dead-letter, idempotencia, rate limiting, degradación graceful, estado distribuido (quién es la fuente de verdad y por qué).
-- **Java/Spring Boot**: DI/IoC container, constructor injection, autoconfiguration, profiles, Spring Data JPA, Flyway, records Java, `Optional`, streams, Actuator, ConfigData (application.yml), `@ConfigurationProperties`.
-- **Análisis de código**: AST vs CST vs regex, JavaParser + symbol solver, tree-sitter, granularidad de módulo, resolución de imports y sus límites, agregación y conteo, capas/heurísticas.
-- **AI applied**: structured outputs, presupuesto de contexto/tokens/coste, caching de llamadas por clave (commit+modelo+esquema), degradación sin depender del proveedor, por qué RAG/LangChain no aplican aquí.
-- **Operations**: logs estructurados (Logback JSON), Actuator health/metrics, Testcontainers, composición local reproducible de varios servicios con Docker Compose, coste de AI por análisis.
-- **Product**: estados vacíos/error/loading, feedback asíncrono, página por UUID (sin auth, local), decisiones de scope documentadas (ADR).
-
----
-
-*Documento de planificación. Las decisiones marcadas como "recomendación" son discutibles antes de implementar su fase; las marcadas como "decisión" (JSONB, api+worker mismo proyecto, Postgres fuente de verdad, Redis Streams, tarball clone, cap de imports, Spring Boot 4.x) se asumen firmes salvo que aparezca una razón técnica nueva.*
+1. **Degenerar en benchmark sintético** → cada escenario es un servicio real; la comparación es una vista, no el producto.
+2. **Scope**: once fases es mucho. Cada fase deja el sistema funcionando y, si hay que recortar, se recorta **P9**; nunca P5-P7, porque sin instrumento no hay producto.
+3. **El entorno contamina la medición** (Docker sobre Windows) → se declara en cada corrida.
+4. **Sesgo hacia Redis** al escribir las reglas del veredicto → hay un test obligatorio en el que **debe ganar la memoria**.
+5. **No terminar**, el riesgo número uno de un proyecto-aprendizaje → fases con gate y un entregable demostrable en cada una.

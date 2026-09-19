@@ -1,0 +1,8 @@
+# Perfil `api`: expone HTTP y aplica las cuotas.
+#
+# NO genera carga a propósito. El generador de carga vive en un proceso aparte
+# (perfil `runner`): si comparte JVM con la API, el recolector de basura y los
+# hilos del generador contaminan la latencia que estamos midiendo y cualquier
+# número que salga es basura.
+server:
+  port: 8000

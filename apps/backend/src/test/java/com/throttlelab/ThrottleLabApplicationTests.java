@@ -1,10 +1,10 @@
-package com.repovisor;
+package com.throttlelab;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest
-class RepovisorApplicationTests {
+class ThrottleLabApplicationTests {
 
 	@Test
 	void contextLoads() {
